@@ -8,13 +8,16 @@ import {
 } from "../lib/combat";
 import {
   AttackDeclaration, ClientAction, ClientMessage, HostMessage, MULTIPLAYER_PROTOCOL_VERSION,
-  RoomSnapshot, Side, decodeClientMessage, decodeHostMessage, makeActionMessage, makeRequestId,
+  RoomSnapshot, Side, decodeClientMessage, decodeHostMessage, deriveAttackDeclaration, makeActionMessage, makeRequestId,
   validateClientMessage,
 } from "../lib/multiplayer";
 import {
   connectionErrorMessage, createRoomCode, inviteUrl, normalizeRoomCode, peerIdFromCode,
   roomCodeFromHash, roomIdFromCode,
 } from "../lib/peer-room";
+import {
+  AttackTurnState, attackTurnOptions, createAttackTurnState, declareTurnAttack, standardAttackComplete,
+} from "../lib/turn-economy";
 import {
   LOCATION_LABELS, LocationKey, PROFESSION_LABELS, PreparedFighter, RACE_LABELS, RawCharacter,
   STAT_KEYS, buildFighter, characterLabel, demoCharacter, parseWitcherFile, patchRawCharacter,
@@ -68,6 +71,33 @@ function cloneFighters(fighters: [PreparedFighter, PreparedFighter]) {
     ...fighter,
     armor: Object.fromEntries(Object.entries(fighter.armor).map(([key, zone]) => [key, { ...zone }])),
   })) as [PreparedFighter, PreparedFighter];
+}
+
+function cannotContinue(fighter: PreparedFighter, settings: CombatSettings) {
+  return fighter.sta <= 0 || (settings.stopAtZero && fighter.hp <= 0);
+}
+
+function attackSequenceLabel(state: AttackTurnState, strikeMode: StrikeMode) {
+  if (state.extraUsed) return strikeMode === "strong" ? "Дополнительная сильная атака" : "Дополнительная быстрая атака";
+  if (strikeMode === "strong") return "Сильная атака";
+  return `Быстрая атака ${state.standardStrikes} из 2`;
+}
+
+function strikeEndsBattle(
+  before: [PreparedFighter, PreparedFighter],
+  after: [PreparedFighter, PreparedFighter],
+  pending: PendingAttack,
+  attackTurn: AttackTurnState,
+  settings: CombatSettings,
+  damageApplied: boolean,
+) {
+  // A manually continued battle may already contain a fighter at zero. Only a
+  // new defeat or the just-paid extra attack should reopen the victory screen.
+  const extraExhaustedAttacker = attackTurn.extraUsed && after[pending.attacker].sta <= 0;
+  const defenderFell = damageApplied
+    && !cannotContinue(before[pending.defender], settings)
+    && cannotContinue(after[pending.defender], settings);
+  return extraExhaustedAttacker || defenderFell;
 }
 
 function StatusPill({ phase }: { phase: Phase }) {
@@ -290,6 +320,7 @@ export default function DuelApp() {
   const [location, setLocation] = useState<LocationKey | "random">("random");
   const [modifier, setModifier] = useState(0);
   const [modifierNote, setModifierNote] = useState("");
+  const [attackTurn, setAttackTurn] = useState<AttackTurnState>(createAttackTurnState());
   const [attackDeclaration, setAttackDeclaration] = useState<AttackDeclaration | null>(null);
   const [pending, setPending] = useState<PendingAttack | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -336,10 +367,11 @@ export default function DuelApp() {
     initiative,
     round,
     turn,
+    attackTurn,
     attackDeclaration,
     pending,
     log,
-  } : null, [online, roomId, revision, phase, players, prepared, fighters, settings, active, firstSide, initiative, round, turn, attackDeclaration, pending, log]);
+  } : null, [online, roomId, revision, phase, players, prepared, fighters, settings, active, firstSide, initiative, round, turn, attackTurn, attackDeclaration, pending, log]);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
@@ -356,7 +388,7 @@ export default function DuelApp() {
     snapshotRef.current = next;
     setRevision(next.revision); setPhase(next.phase); setPlayers(next.players); setPrepared(next.prepared); setFighters(next.fighters);
     setSettings(next.settings); setActive(next.active); setFirstSide(next.firstSide); setInitiative(next.initiative); setRound(next.round);
-    setTurn(next.turn); setAttackDeclaration(next.attackDeclaration); setPending(next.pending); setLog(next.log);
+    setTurn(next.turn); setAttackTurn(next.attackTurn); setAttackDeclaration(next.attackDeclaration); setPending(next.pending); setLog(next.log);
     if (next.phase === "setup" && ownSide !== null && next.prepared[ownSide] === null) {
       setImports((current) => ownSide === 0 ? [null, current[1]] : [current[0], null]);
     }
@@ -372,9 +404,22 @@ export default function DuelApp() {
   function advanceOnline(base: RoomSnapshot, nextFighters = base.fighters) {
     if (!nextFighters) return;
     const next: Side = base.active === 0 ? 1 : 0;
-    setActive(next); setTurn(base.turn + 1); setPending(null); setAttackDeclaration(null);
+    setActive(next); setTurn(base.turn + 1); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null);
     setWeaponUid(nextFighters[next].weapons[0]?.uid ?? ""); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal");
     if (next === base.firstSide) setRound(base.round + 1);
+  }
+
+  function settleOnlineStrike(base: RoomSnapshot, nextFighters = base.fighters, battleEnded = false) {
+    if (!nextFighters) return;
+    if (battleEnded) {
+      setPhase("complete"); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null);
+      return;
+    }
+    if (base.attackTurn.extraUsed) {
+      advanceOnline(base, nextFighters);
+      return;
+    }
+    setPending(null); setAttackDeclaration(null); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal");
   }
 
   function performHostAction(action: ClientAction, actor: Side, base: RoomSnapshot) {
@@ -394,12 +439,26 @@ export default function DuelApp() {
         const values: [number, number] = [built[0].initiativeBase + rolls[0].total, built[1].initiativeBase + rolls[1].total];
         const first: Side = values[0] === values[1] ? (built[0].initiativeBase >= built[1].initiativeBase ? 0 : 1) : values[0] > values[1] ? 0 : 1;
         setFighters(built); setInitiative(values); setActive(first); setFirstSide(first); setWeaponUid(built[first].weapons[0]?.uid ?? "");
-        setPhase("combat"); setRound(1); setTurn(1); setPending(null); setAttackDeclaration(null);
+        setPhase("combat"); setRound(1); setTurn(1); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null);
         setLog([makeLog(1, 0, "system", "Бой начался", `${built[0].name} против ${built[1].name}. Seed ${base.settings.seed}.`), makeLog(1, 0, "roll", "Инициатива", `${built[0].name}: ${values[0]} (${rolls[0].text}); ${built[1].name}: ${values[1]} (${rolls[1].text}).`)]);
         break;
       }
       case "declare_attack": {
-        setAttackDeclaration({ attacker: actor, defender: actor === 0 ? 1 : 0, weaponUid: action.weaponUid, strikeMode: action.strikeMode, locationChoice: action.locationChoice, modifier: action.modifier, modifierNote: action.modifierNote });
+        if (!base.fighters) return;
+        const weapon = base.fighters[actor].weapons.find((item) => item.uid === action.weaponUid);
+        if (!weapon?.damage.trim()) return;
+        const derived = deriveAttackDeclaration(base, action);
+        if (!derived.ok) return;
+        setAttackTurn(derived.attackTurn);
+        setAttackDeclaration(derived.declaration);
+        if (derived.declaration.staminaCost) {
+          const updated = cloneFighters(base.fighters);
+          const fighter = updated[actor];
+          const before = fighter.sta;
+          fighter.sta = Math.max(0, fighter.sta - derived.declaration.staminaCost);
+          setFighters(updated);
+          setLog((current) => [makeLog(base.round, base.turn, "system", `${fighter.name} проводит дополнительную атаку`, `Выносливость ${before} → ${fighter.sta}; штраф −3 к попаданию.`), ...current]);
+        }
         break;
       }
       case "choose_defense": {
@@ -407,10 +466,11 @@ export default function DuelApp() {
         const declaration = base.attackDeclaration;
         const weapon = base.fighters[declaration.attacker].weapons.find((item) => item.uid === declaration.weaponUid);
         if (!weapon) return;
-        const result = resolveAttack({ fighters: base.fighters, attacker: declaration.attacker, weapon, defenseMode: action.defenseMode, strikeMode: declaration.strikeMode, locationChoice: declaration.locationChoice, modifier: declaration.modifier, settings: base.settings, rng: rngRef.current });
+        const result = resolveAttack({ fighters: base.fighters, attacker: declaration.attacker, weapon, defenseMode: action.defenseMode, strikeMode: declaration.strikeMode, locationChoice: declaration.locationChoice, modifier: declaration.modifier + declaration.automaticModifier, settings: base.settings, rng: rngRef.current });
         setPending(result); setAttackDeclaration(null);
         const totalModifier = result.attackModifier + result.aimedModifier;
-        setLog((current) => [makeLog(base.round, base.turn, "roll", `${base.fighters![result.attacker].name} атакует ${base.fighters![result.defender].name}`, `${result.attackRoll.text} + база ${result.attackBase}${totalModifier ? ` ${totalModifier >= 0 ? "+" : "−"} ${Math.abs(totalModifier)}` : ""} = ${result.attackTotal}; защита ${result.defenseTotal}.${declaration.modifierNote ? ` ${declaration.modifierNote}` : ""}`), ...current]);
+        const systemPenalties = [declaration.strikeMode === "strong" ? "сильная −3" : "", declaration.extra ? "дополнительная −3" : ""].filter(Boolean).join(", ");
+        setLog((current) => [makeLog(base.round, base.turn, "roll", `${base.fighters![result.attacker].name}: ${attackSequenceLabel(base.attackTurn, declaration.strikeMode).toLowerCase()}`, `${result.attackRoll.text} + база ${result.attackBase}${totalModifier ? ` ${totalModifier >= 0 ? "+" : "−"} ${Math.abs(totalModifier)}` : ""} = ${result.attackTotal}; защита ${result.defenseTotal}.${systemPenalties ? ` Системные штрафы: ${systemPenalties}.` : ""}${declaration.modifierNote ? ` ${declaration.modifierNote}` : ""}`), ...current]);
         break;
       }
       case "apply_pending": {
@@ -422,12 +482,22 @@ export default function DuelApp() {
         setFighters(updated);
         const critical = base.pending.criticalLevel ? ` ${base.pending.criticalLevel} критическое ранение: +${base.pending.criticalBonus} урона; конкретную рану выберите по книге.` : "";
         setLog((current) => [makeLog(base.round, base.turn, "damage", `${target.name} получает ${base.pending!.finalDamage} урона`, `${LOCATION_LABELS[base.pending!.location]} · ${base.pending!.formula}.${critical}`), ...current]);
-        if ((base.settings.stopAtZero && target.hp <= 0) || target.sta <= 0) { setPhase("complete"); setPending(null); } else advanceOnline(base, updated);
+        settleOnlineStrike(base, updated, strikeEndsBattle(base.fighters, updated, base.pending, base.attackTurn, base.settings, true));
         break;
       }
       case "finish_miss": {
         if (!base.pending) return;
         setLog((current) => [makeLog(base.round, base.turn, "system", "Атака не попала", `Атака ${base.pending!.attackTotal} против защиты ${base.pending!.defenseTotal}.`), ...current]);
+        settleOnlineStrike(base, base.fighters, Boolean(base.fighters && strikeEndsBattle(base.fighters, base.fighters, base.pending, base.attackTurn, base.settings, false)));
+        break;
+      }
+      case "end_turn": {
+        if (!base.fighters) return;
+        const fighter = base.fighters[base.active];
+        const detail = standardAttackComplete(base.attackTurn)
+          ? "Основное атакующее действие завершено без дополнительной атаки."
+          : "Вторая быстрая атака не использована.";
+        setLog((current) => [makeLog(base.round, base.turn, "system", `${fighter.name} завершает ход`, detail), ...current]);
         advanceOnline(base);
         break;
       }
@@ -444,7 +514,7 @@ export default function DuelApp() {
       case "continue_battle": setPhase("combat"); setLog((current) => [makeLog(base.round, base.turn, "system", "Бой продолжен вручную", "Порог завершения проигнорирован владельцем комнаты."), ...current]); advanceOnline(base); break;
       case "reset_room": {
         setImports([null, null]); setPrepared([null, null]); setFighters(null); setPhase("setup"); setActive(0); setFirstSide(0); setInitiative([0, 0]);
-        setRound(1); setTurn(1); setPending(null); setAttackDeclaration(null); setLog([]); setExportOpen(false);
+        setRound(1); setTurn(1); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null); setLog([]); setExportOpen(false);
         setPlayers((current) => current.map((player) => ({ ...player, ready: false })) as RoomSnapshot["players"]);
         break;
       }
@@ -560,7 +630,7 @@ export default function DuelApp() {
     peer.on("open", () => {
       if (disposed) return;
       if (isHost) { setNetworkStatus("waiting"); setPlayers((current) => [{ ...current[0], connected: true }, current[1]]); }
-      else attachGuestConnection(peer.connect(peerIdFromCode(onlineSession.code), { label: "witcher-pvp-v1", serialization: "json", reliable: true }));
+      else attachGuestConnection(peer.connect(peerIdFromCode(onlineSession.code), { label: "witcher-pvp-v2", serialization: "json", reliable: true }));
     });
     if (isHost) peer.on("connection", attachHostConnection);
     peer.on("error", handleError);
@@ -579,8 +649,25 @@ export default function DuelApp() {
   const activeFighter = fighters?.[active] ?? null;
   const selectedWeapon = activeFighter?.weapons.find((weapon) => weapon.uid === weaponUid) ?? activeFighter?.weapons[0] ?? null;
   const filteredLog = logFilter === "all" ? log : log.filter((entry) => entry.type === logFilter);
-  const defeated = fighters?.find((fighter) => fighter.hp <= 0 || fighter.sta <= 0) ?? null;
-  const winnerName = defeated && fighters ? fighters.find((fighter) => fighter.id !== defeated.id)?.name : null;
+  const defeatedSides = fighters ? ([0, 1] as Side[]).filter((side) => cannotContinue(fighters[side], settings)) : [];
+  const defeated = defeatedSides.length === 1 && fighters ? fighters[defeatedSides[0]] : null;
+  const draw = defeatedSides.length === 2;
+  const winnerName = defeated && fighters ? fighters[defeatedSides[0] === 0 ? 1 : 0].name : null;
+  const turnOptions = attackTurnOptions(attackTurn, activeFighter?.sta ?? 0);
+  const choosingExtra = turnOptions.standardComplete && !attackTurn.extraUsed && !attackTurn.ended;
+  const secondFast = attackTurn.standardMode === "normal" && attackTurn.standardStrikes === 1;
+  const actionStrike: StrikeMode = secondFast ? "normal" : strike;
+  const selectedExtraAvailable = actionStrike === "strong" ? turnOptions.canExtraStrong : turnOptions.canExtraFast;
+  const rollButtonLabel = secondFast
+    ? "Провести вторую быструю"
+    : choosingExtra
+      ? `Провести дополнительную ${actionStrike === "strong" ? "сильную" : "быструю"}`
+      : online ? "Объявить атаку" : "Бросить атаку";
+  const currentAttackLabel = attackDeclaration
+    ? attackSequenceLabel(attackTurn, attackDeclaration.strikeMode)
+    : pending
+      ? attackSequenceLabel(attackTurn, pending.strikeMode)
+      : null;
   const canAct = !online || (connected && ownSide === active);
   const canDefend = online && connected && attackDeclaration?.defender === ownSide;
   const ownedSources = useMemo<OwnedSource[]>(() => {
@@ -616,7 +703,7 @@ export default function DuelApp() {
     const rolls = [d10(rngRef.current, settings.explodingDice), d10(rngRef.current, settings.explodingDice)] as const;
     const values: [number, number] = [built[0].initiativeBase + rolls[0].total, built[1].initiativeBase + rolls[1].total];
     const first: Side = values[0] === values[1] ? (built[0].initiativeBase >= built[1].initiativeBase ? 0 : 1) : values[0] > values[1] ? 0 : 1;
-    setFighters(built); setInitiative(values); setActive(first); setFirstSide(first); setWeaponUid(built[first].weapons[0]?.uid ?? ""); setPhase("combat"); setRound(1); setTurn(1); setPending(null);
+    setFighters(built); setInitiative(values); setActive(first); setFirstSide(first); setWeaponUid(built[first].weapons[0]?.uid ?? ""); setPhase("combat"); setRound(1); setTurn(1); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null);
     setLog([makeLog(1, 0, "system", "Бой начался", `${built[0].name} против ${built[1].name}. Seed ${settings.seed}.`), makeLog(1, 0, "roll", "Инициатива", `${built[0].name}: ${values[0]} (${rolls[0].text}); ${built[1].name}: ${values[1]} (${rolls[1].text}).`)]);
   }
 
@@ -625,17 +712,36 @@ export default function DuelApp() {
   function rollOrDeclareAttack() {
     if (!fighters || !selectedWeapon || pending || attackDeclaration) return;
     if (!selectedWeapon.damage.trim()) { setLog((current) => [makeLog(round, turn, "system", "Бросок не выполнен", `${selectedWeapon.name}: в исходном листе не указана формула урона.`), ...current]); return; }
-    if (online) { dispatchOnline({ type: "declare_attack", weaponUid: selectedWeapon.uid, strikeMode: strike, locationChoice: location, modifier, modifierNote }); return; }
-    const result = resolveAttack({ fighters, attacker: active, weapon: selectedWeapon, defenseMode: defense, strikeMode: strike, locationChoice: location, modifier, settings, rng: rngRef.current });
+    if (online) { dispatchOnline({ type: "declare_attack", weaponUid: selectedWeapon.uid, strikeMode: actionStrike, locationChoice: location, modifier, modifierNote }); return; }
+    const extra = standardAttackComplete(attackTurn);
+    const transition = declareTurnAttack(attackTurn, { strikeMode: actionStrike, extra }, fighters[active].sta);
+    if (!transition.ok) {
+      const detail = transition.code === "insufficient_stamina" ? "Для дополнительной атаки нужно 3 Выносливости." : "Эта атака не соответствует выбранной последовательности хода.";
+      setLog((current) => [makeLog(round, turn, "system", "Атака недоступна", detail), ...current]);
+      return;
+    }
+    let fightersForAttack = fighters;
+    if (transition.staminaCost) {
+      const updated = cloneFighters(fighters);
+      const fighter = updated[active];
+      const before = fighter.sta;
+      fighter.sta = Math.max(0, fighter.sta - transition.staminaCost);
+      fightersForAttack = updated;
+      setFighters(updated);
+      setLog((current) => [makeLog(round, turn, "system", `${fighter.name} проводит дополнительную атаку`, `Выносливость ${before} → ${fighter.sta}; штраф −3 к попаданию.`), ...current]);
+    }
+    setAttackTurn(transition.state);
+    const result = resolveAttack({ fighters: fightersForAttack, attacker: active, weapon: selectedWeapon, defenseMode: defense, strikeMode: actionStrike, locationChoice: location, modifier: modifier + transition.hitModifier, settings, rng: rngRef.current });
     setPending(result);
     const totalModifier = result.attackModifier + result.aimedModifier;
-    setLog((current) => [makeLog(round, turn, "roll", `${fighters[result.attacker].name} атакует ${fighters[result.defender].name}`, `${result.attackRoll.text} + база ${result.attackBase}${totalModifier ? ` ${totalModifier >= 0 ? "+" : "−"} ${Math.abs(totalModifier)}` : ""} = ${result.attackTotal}; защита ${result.defenseTotal}.${modifierNote ? ` ${modifierNote}` : ""}`), ...current]);
+    const systemPenalties = [actionStrike === "strong" ? "сильная −3" : "", extra ? "дополнительная −3" : ""].filter(Boolean).join(", ");
+    setLog((current) => [makeLog(round, turn, "roll", `${fightersForAttack[result.attacker].name}: ${attackSequenceLabel(transition.state, actionStrike).toLowerCase()}`, `${result.attackRoll.text} + база ${result.attackBase}${totalModifier ? ` ${totalModifier >= 0 ? "+" : "−"} ${Math.abs(totalModifier)}` : ""} = ${result.attackTotal}; защита ${result.defenseTotal}.${systemPenalties ? ` Системные штрафы: ${systemPenalties}.` : ""}${modifierNote ? ` ${modifierNote}` : ""}`), ...current]);
   }
 
   function advanceLocal(nextFighters = fighters) {
     if (!nextFighters) return;
     const next: Side = active === 0 ? 1 : 0;
-    setActive(next); setTurn((value) => value + 1); setPending(null); setWeaponUid(nextFighters[next].weapons[0]?.uid ?? ""); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal");
+    setActive(next); setTurn((value) => value + 1); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null); setWeaponUid(nextFighters[next].weapons[0]?.uid ?? ""); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal");
     if (next === firstSide) setRound((value) => value + 1);
   }
 
@@ -649,20 +755,35 @@ export default function DuelApp() {
     setFighters(updated);
     const critical = pending.criticalLevel ? ` ${pending.criticalLevel} критическое ранение: +${pending.criticalBonus} урона; конкретную рану выберите по книге.` : "";
     setLog((current) => [makeLog(round, turn, "damage", `${target.name} получает ${pending.finalDamage} урона`, `${LOCATION_LABELS[pending.location]} · ${pending.formula}.${critical}`), ...current]);
-    if ((settings.stopAtZero && target.hp <= 0) || target.sta <= 0) { setPhase("complete"); setPending(null); return; }
-    advanceLocal(updated);
+    if (strikeEndsBattle(fighters, updated, pending, attackTurn, settings, true)) { setPhase("complete"); setAttackTurn(createAttackTurnState()); setPending(null); return; }
+    if (attackTurn.extraUsed) advanceLocal(updated);
+    else { setPending(null); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal"); }
   }
 
   function finishMiss() {
     if (online) { dispatchOnline({ type: "finish_miss" }); return; }
     if (!pending) return;
     setLog((current) => [makeLog(round, turn, "system", "Атака не попала", `Атака ${pending.attackTotal} против защиты ${pending.defenseTotal}.`), ...current]);
+    if (fighters && strikeEndsBattle(fighters, fighters, pending, attackTurn, settings, false)) { setPhase("complete"); setAttackTurn(createAttackTurnState()); setPending(null); return; }
+    if (attackTurn.extraUsed) advanceLocal();
+    else { setPending(null); setModifier(0); setModifierNote(""); setLocation("random"); setStrike("normal"); }
+  }
+
+  function endCurrentTurn() {
+    const options = attackTurnOptions(attackTurn, activeFighter?.sta ?? 0);
+    if (!options.canEndTurn || pending || attackDeclaration) return;
+    if (online) { dispatchOnline({ type: "end_turn" }); return; }
+    if (!fighters) return;
+    const detail = standardAttackComplete(attackTurn)
+      ? "Основное атакующее действие завершено без дополнительной атаки."
+      : "Вторая быстрая атака не использована.";
+    setLog((current) => [makeLog(round, turn, "system", `${fighters[active].name} завершает ход`, detail), ...current]);
     advanceLocal();
   }
 
   function recoverOrPass(action: "recover" | "pass") {
     if (online) { dispatchOnline({ type: action }); return; }
-    if (!fighters) return;
+    if (!fighters || attackTurn.standardMode !== null || pending || attackDeclaration) return;
     const updated = cloneFighters(fighters);
     const actor = updated[active];
     if (action === "recover") { const before = actor.sta; actor.sta = Math.min(actor.maxSta, actor.sta + actor.rec); setLog((current) => [makeLog(round, turn, "system", `${actor.name} восстанавливается`, `Выносливость ${before} → ${actor.sta}.`), ...current]); }
@@ -671,7 +792,7 @@ export default function DuelApp() {
   }
 
   function resetLocalState() {
-    setImports([null, null]); setPrepared([null, null]); setFighters(null); setPhase("setup"); setLog([]); setPending(null); setAttackDeclaration(null); setExportOpen(false); setRevision(0);
+    setImports([null, null]); setPrepared([null, null]); setFighters(null); setPhase("setup"); setLog([]); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null); setExportOpen(false); setRevision(0);
     snapshotRef.current = null; committingRevisionRef.current = null; seenRequestIdsRef.current.clear(); setGuestSynced(false);
   }
 
@@ -745,25 +866,29 @@ export default function DuelApp() {
             <FighterCard fighter={fighters[0]} side={0} active={active === 0 && phase === "combat"} owned={!online || ownSide === 0} />
             <section className="action-panel" aria-live="polite">
               {phase === "complete" ? (
-                <div className="victory-card"><span className="victory-rune" aria-hidden="true">✦</span><span className="eyebrow">Поединок завершён</span><h2>Побеждает<br />{winnerName}</h2><p>{defeated?.name} больше не может продолжать бой.</p><div className="victory-stats"><span><b>{round}</b> раундов</span><span><b>{Math.max(0, log.filter((entry) => entry.type === "roll").length - 1)}</b> атак</span></div><button className="button button-primary" type="button" onClick={() => setExportOpen(true)}>Экспортировать результат</button>{(!online || session.kind === "host") ? <button className="text-button" type="button" onClick={resumeAfterZero}>Продолжить по решению ведущего</button> : <p className="wait-inline">Владелец комнаты решает, продолжать ли бой.</p>}</div>
+                <div className="victory-card"><span className="victory-rune" aria-hidden="true">✦</span><span className="eyebrow">Поединок завершён</span><h2>{draw ? "Ничья" : <>Побеждает<br />{winnerName}</>}</h2><p>{draw ? "Оба бойца больше не могут продолжать бой." : `${defeated?.name} больше не может продолжать бой.`}</p><div className="victory-stats"><span><b>{round}</b> раундов</span><span><b>{Math.max(0, log.filter((entry) => entry.type === "roll").length - 1)}</b> атак</span></div><button className="button button-primary" type="button" onClick={() => setExportOpen(true)}>Экспортировать результат</button>{(!online || session.kind === "host") ? <button className="text-button" type="button" onClick={resumeAfterZero}>Продолжить по решению ведущего</button> : <p className="wait-inline">Владелец комнаты решает, продолжать ли бой.</p>}</div>
               ) : attackDeclaration ? (
-                canDefend ? <div className="defense-card"><span className="defense-rune" aria-hidden="true">◇</span><span className="eyebrow">Вас атакуют</span><h2>Выберите защиту</h2><p>{fighters[attackDeclaration.attacker].name} объявляет атаку. Бросок произойдёт после вашего ответа.</p><label><span>Способ защиты</span><select value={defense} onChange={(event) => setDefense(event.target.value as DefenseMode)}><option value="dodge">Уклониться</option><option value="reposition">Изменить позицию</option><option value="block">Блокировать</option><option value="none">Не защищаться (СЛ 10)</option></select></label><button className="button button-roll" type="button" onClick={() => dispatchOnline({ type: "choose_defense", defenseMode: defense })}>Подтвердить защиту</button></div>
+                canDefend ? <div className="defense-card"><span className="defense-rune" aria-hidden="true">◇</span><span className="eyebrow">{currentAttackLabel ?? "Вас атакуют"}</span><h2>Выберите защиту</h2><p>{fighters[attackDeclaration.attacker].name} объявляет атаку{attackDeclaration.extra ? ` за 3 Выносливости со штрафом −3${attackDeclaration.strikeMode === "strong" ? " (−6 вместе со штрафом сильной атаки)" : ""}` : ""}. Бросок произойдёт после вашего ответа.</p><label><span>Способ защиты</span><select value={defense} onChange={(event) => setDefense(event.target.value as DefenseMode)}><option value="dodge">Уклониться</option><option value="reposition">Изменить позицию</option><option value="block">Блокировать</option><option value="none">Не защищаться (СЛ 10)</option></select></label><button className="button button-roll" type="button" onClick={() => dispatchOnline({ type: "choose_defense", defenseMode: defense })}>Подтвердить защиту</button></div>
                   : <WaitingAction title="Соперник выбирает защиту" detail="Объявленная атака уже передана. Результат появится на обоих устройствах." />
               ) : pending ? (
                 <div className={`result-card ${pending.hit ? "result-hit" : "result-miss"}`}>
-                  <span className="result-symbol" aria-hidden="true">{pending.hit ? "✦" : "◇"}</span><span className="eyebrow">Результат броска</span><h2>{pending.hit ? "Попадание" : "Промах"}</h2>
+                  <span className="result-symbol" aria-hidden="true">{pending.hit ? "✦" : "◇"}</span><span className="eyebrow">{currentAttackLabel ?? "Результат броска"}</span><h2>{pending.hit ? "Попадание" : "Промах"}</h2>
                   <div className="versus-result"><span><small>Атака</small><b>{pending.attackTotal}</b></span><i>против</i><span><small>Защита</small><b>{pending.defenseTotal}</b></span></div>
                   {pending.hit && <><div className="result-summary"><span><small>Зона</small><b>{LOCATION_LABELS[pending.location]}</b></span><span><small>Урон</small><b>{pending.finalDamage}</b></span><span><small>Броня</small><b>{pending.armorSp}</b></span></div><code className="formula">{pending.formula}</code>{pending.criticalLevel && <p className="critical-note">⚠ {pending.criticalLevel} критическое ранение. Конкретный эффект выберите по таблице вашей книги.</p>}</>}
-                  <div className="result-buttons">{canAct ? (pending.hit ? <button className="button button-primary" type="button" onClick={applyPendingResult}>Применить результат</button> : <button className="button button-primary" type="button" onClick={finishMiss}>Завершить ход</button>) : <p className="wait-inline">Активный игрок подтверждает результат.</p>}{!online && <button className="button button-quiet" type="button" onClick={() => setPending(null)}>Отменить бросок</button>}</div>
+                  <div className="result-buttons">{canAct ? (pending.hit ? <button className="button button-primary" type="button" onClick={applyPendingResult}>Применить результат</button> : <button className="button button-primary" type="button" onClick={finishMiss}>Подтвердить промах</button>) : <p className="wait-inline">Активный игрок подтверждает результат.</p>}</div>
                 </div>
               ) : canAct ? (
                 <><div className="action-heading"><span className="eyebrow">Конструктор действия</span><h2>Ваш ход: {activeFighter?.name}</h2><p>{online ? "Выберите атаку — соперник сам укажет способ защиты." : "Атака рассчитывается сейчас, урон применяется после подтверждения."}</p></div>
                   <div className="action-form">
+                    <div className={`turn-sequence ${choosingExtra ? "turn-sequence-extra" : ""}`} role="status"><b>{secondFast ? "Быстрая атака 2 из 2" : choosingExtra ? "Основное действие завершено" : "Основное действие"}</b><span>{secondFast ? "Вторая атака также должна быть быстрой." : choosingExtra ? "Можно завершить ход или купить одну дополнительную атаку." : "Выберите две быстрые атаки либо одну сильную."}</span></div>
                     <label><span>Оружие</span><select value={weaponUid} onChange={(event) => setWeaponUid(event.target.value)}>{activeFighter?.weapons.map((weapon) => <option value={weapon.uid} key={weapon.uid}>{weapon.name} · {weapon.damage || "урон не указан"}</option>)}</select></label>
-                    <div className="two-columns"><label><span>Тип удара</span><select value={strike} onChange={(event) => setStrike(event.target.value as StrikeMode)}><option value="normal">Обычный</option><option value="strong">Сильный (−3, урон ×2)</option></select></label>{!online && <label><span>Защита цели</span><select value={defense} onChange={(event) => setDefense(event.target.value as DefenseMode)}><option value="dodge">Уклониться</option><option value="reposition">Изменить позицию</option><option value="block">Блокировать</option><option value="none">Не защищаться (СЛ 10)</option></select></label>}</div>
+                    <div className="two-columns"><label><span>{choosingExtra ? "Дополнительная атака" : "Тип удара"}</span><select value={actionStrike} disabled={secondFast} onChange={(event) => setStrike(event.target.value as StrikeMode)}><option value="normal">{secondFast ? "Быстрая 2 из 2" : choosingExtra ? "Быстрая (−3, 3 Вын)" : "Быстрая (до 2 за ход)"}</option>{!secondFast && <option value="strong">{choosingExtra ? "Сильная (−6, 3 Вын, урон ×2)" : "Сильная (−3, урон ×2)"}</option>}</select></label>{!online && <label><span>Защита цели</span><select value={defense} onChange={(event) => setDefense(event.target.value as DefenseMode)}><option value="dodge">Уклониться</option><option value="reposition">Изменить позицию</option><option value="block">Блокировать</option><option value="none">Не защищаться (СЛ 10)</option></select></label>}</div>
                     <label><span>Зона попадания</span><select value={location} onChange={(event) => setLocation(event.target.value as LocationKey | "random")}><option value="random">Определить броском</option><option value="head">Голова ({AIM_MODIFIERS.head})</option><option value="torso">Туловище ({AIM_MODIFIERS.torso})</option><option value="arms">Рука ({AIM_MODIFIERS.arms})</option><option value="legs">Нога ({AIM_MODIFIERS.legs})</option></select></label>
                     <div className="modifier-row"><label><span>Модификатор</span><input type="number" value={modifier} onChange={(event) => setModifier(Number(event.target.value))} /></label><label><span>Причина</span><input value={modifierNote} onChange={(event) => setModifierNote(event.target.value)} placeholder="Свет, дистанция, эффект…" /></label></div>
-                    <button className="button button-roll" type="button" onClick={rollOrDeclareAttack}><span aria-hidden="true">◆</span> {online ? "Объявить атаку" : "Бросить атаку"}</button><div className="secondary-actions"><button type="button" onClick={() => recoverOrPass("recover")}>Восстановить {activeFighter?.rec} Вын</button><button type="button" onClick={() => recoverOrPass("pass")}>Пропустить ход</button></div>
+                    {choosingExtra && !selectedExtraAvailable && <p className="attack-unavailable" role="status">Для дополнительной атаки нужно 3 Выносливости.</p>}
+                    <button className="button button-roll" disabled={choosingExtra && !selectedExtraAvailable} type="button" onClick={rollOrDeclareAttack}><span aria-hidden="true">◆</span> {rollButtonLabel}</button>
+                    {turnOptions.canEndTurn && <button className="button button-end-turn" type="button" onClick={endCurrentTurn}>Завершить ход без {choosingExtra ? "дополнительной атаки" : "второй быстрой"}</button>}
+                    {attackTurn.standardMode === null && <div className="secondary-actions"><button type="button" onClick={() => recoverOrPass("recover")}>Восстановить {activeFighter?.rec} Вын</button><button type="button" onClick={() => recoverOrPass("pass")}>Пропустить ход</button></div>}
                   </div></>
               ) : <WaitingAction title={connected ? "Ход соперника" : "Связь с соперником прервана"} detail={connected ? `${fighters[active].name} выбирает действие на другом устройстве.` : "Бой приостановлен. Подключитесь снова, чтобы получить актуальное состояние."} />}
             </section>

@@ -5,10 +5,12 @@ import {
   MULTIPLAYER_PROTOCOL_VERSION,
   decodeClientMessage,
   decodeHostMessage,
+  deriveAttackDeclaration,
   isRoomSnapshot,
   makeActionMessage,
   validateClientMessage,
 } from "../app/lib/multiplayer.ts";
+import { createAttackTurnState } from "../app/lib/turn-economy.ts";
 import { buildFighter, demoCharacter, parseWitcherFile, prepareFighter } from "../app/lib/witcher.ts";
 
 const settings = {
@@ -45,6 +47,7 @@ function snapshot(overrides = {}) {
     initiative: [17, 17],
     round: 1,
     turn: 1,
+    attackTurn: createAttackTurnState(),
     attackDeclaration: null,
     pending: null,
     log: [],
@@ -64,17 +67,23 @@ function declareMessage(state, overrides = {}) {
   }, "request_attack_1");
 }
 
-function declaration(state, overrides = {}) {
+function withDeclaredAttack(state, actionOverrides = {}, declarationOverrides = {}) {
+  const action = declareMessage(state, actionOverrides).action;
+  const derived = deriveAttackDeclaration(state, action);
+  assert.equal(derived.ok, true);
   return {
-    attacker: state.active,
-    defender: state.active === 0 ? 1 : 0,
-    weaponUid: state.fighters[state.active].weapons[0].uid,
-    strikeMode: "normal",
-    locationChoice: "random",
-    modifier: 0,
-    modifierNote: "",
-    ...overrides,
+    ...state,
+    stage: "defense",
+    attackTurn: derived.attackTurn,
+    attackDeclaration: { ...derived.declaration, ...declarationOverrides },
   };
+}
+
+function afterResolvedAttack(state, actionOverrides = {}) {
+  const action = declareMessage(state, actionOverrides).action;
+  const derived = deriveAttackDeclaration(state, action);
+  assert.equal(derived.ok, true);
+  return { ...state, stage: "action", attackTurn: derived.attackTurn, attackDeclaration: null, pending: null };
 }
 
 test("snapshots cross JSON transport without sending the original character sheet", () => {
@@ -106,12 +115,15 @@ test("snapshot validation rejects a fighter that leaks its raw sheet", () => {
 test("snapshot stage must match declaration and pending state", () => {
   const base = snapshot();
   assert.equal(isRoomSnapshot({ ...base, stage: "defense" }), false);
-  assert.equal(isRoomSnapshot({ ...base, stage: "defense", attackDeclaration: declaration(base) }), true);
+  assert.equal(isRoomSnapshot(withDeclaredAttack(base)), true);
   assert.equal(isRoomSnapshot({ ...base, fighters: null }), false);
 });
 
 test("decoder rejects incompatible versions and malformed declarations", () => {
   const state = snapshot();
+  assert.equal(MULTIPLAYER_PROTOCOL_VERSION, 2);
+  const legacyVersion = { ...declareMessage(state), protocolVersion: 1 };
+  assert.equal(decodeClientMessage(legacyVersion).code, "protocol_mismatch");
   const wrongVersion = { ...declareMessage(state), protocolVersion: 99 };
   assert.deepEqual(decodeClientMessage(wrongVersion), {
     ok: false,
@@ -123,6 +135,33 @@ test("decoder rejects incompatible versions and malformed declarations", () => {
   const decoded = decodeClientMessage(malformed);
   assert.equal(decoded.ok, false);
   assert.equal(decoded.code, "invalid_message");
+
+  const injectedDerivedField = structuredClone(declareMessage(state));
+  injectedDerivedField.action.extra = false;
+  assert.equal(decodeClientMessage(injectedDerivedField).ok, false);
+});
+
+test("snapshot declarations carry strict host-derived extra attack fields", () => {
+  const base = snapshot();
+  const standard = withDeclaredAttack(base);
+  assert.equal(isRoomSnapshot(standard), true);
+  assert.equal(standard.attackDeclaration.extra, false);
+  assert.equal(standard.attackDeclaration.automaticModifier, 0);
+  assert.equal(standard.attackDeclaration.staminaCost, 0);
+
+  const completedStrong = afterResolvedAttack(base, { strikeMode: "strong" });
+  const extra = withDeclaredAttack(completedStrong, { strikeMode: "normal" });
+  assert.equal(isRoomSnapshot(extra), true);
+  assert.equal(extra.attackDeclaration.extra, true);
+  assert.equal(extra.attackDeclaration.automaticModifier, -3);
+  assert.equal(extra.attackDeclaration.staminaCost, 3);
+  assert.equal(extra.attackTurn.extraUsed, true);
+
+  assert.equal(isRoomSnapshot({
+    ...extra,
+    attackDeclaration: { ...extra.attackDeclaration, automaticModifier: 0 },
+  }), false);
+  assert.equal(isRoomSnapshot({ ...extra, unexpected: true }), false);
 });
 
 test("fighter submission accepts prepared data and rejects raw sheets", () => {
@@ -155,9 +194,58 @@ test("a player cannot declare an attack with the opponent's weapon", () => {
   assert.equal(validateClientMessage(forged, 1, state).code, "unknown_weapon");
 });
 
+test("host rejects a weapon without a damage formula before changing the turn", () => {
+  const state = snapshot();
+  state.fighters[state.active].weapons[0].damage = "";
+  assert.equal(validateClientMessage(declareMessage(state), 1, state).code, "invalid_attack_sequence");
+  assert.deepEqual(state.attackTurn, createAttackTurnState());
+});
+
+test("host enforces two fast strikes or one strong before deriving one extra attack", () => {
+  const base = snapshot();
+  const firstFast = declareMessage(base, { strikeMode: "normal" });
+  assert.deepEqual(validateClientMessage(firstFast, 1, base), { ok: true });
+
+  const afterFirstFast = afterResolvedAttack(base, { strikeMode: "normal" });
+  assert.equal(
+    validateClientMessage(declareMessage(afterFirstFast, { strikeMode: "strong" }), 1, afterFirstFast).code,
+    "invalid_attack_sequence",
+  );
+  assert.deepEqual(validateClientMessage(declareMessage(afterFirstFast), 1, afterFirstFast), { ok: true });
+
+  const afterSecondFast = afterResolvedAttack(afterFirstFast, { strikeMode: "normal" });
+  const extraAction = declareMessage(afterSecondFast, { strikeMode: "strong" });
+  assert.deepEqual(validateClientMessage(extraAction, 1, afterSecondFast), { ok: true });
+  const derivedExtra = deriveAttackDeclaration(afterSecondFast, extraAction.action);
+  assert.equal(derivedExtra.ok, true);
+  assert.equal(derivedExtra.declaration.extra, true);
+  assert.equal(derivedExtra.declaration.automaticModifier, -3);
+  assert.equal(derivedExtra.declaration.staminaCost, 3);
+
+  const afterExtra = afterResolvedAttack(afterSecondFast, { strikeMode: "strong" });
+  assert.equal(
+    validateClientMessage(declareMessage(afterExtra), 1, afterExtra).code,
+    "invalid_attack_sequence",
+  );
+
+  const afterStrong = afterResolvedAttack(base, { strikeMode: "strong" });
+  assert.deepEqual(validateClientMessage(declareMessage(afterStrong), 1, afterStrong), { ok: true });
+});
+
+test("host rejects an extra attack when the active fighter has less than 3 STA", () => {
+  const base = snapshot();
+  const afterStrong = afterResolvedAttack(base, { strikeMode: "strong" });
+  const lowStamina = structuredClone(afterStrong);
+  lowStamina.fighters[lowStamina.active].sta = 2;
+  assert.equal(
+    validateClientMessage(declareMessage(lowStamina), 1, lowStamina).code,
+    "insufficient_stamina",
+  );
+});
+
 test("only the defending player chooses defense after an attack declaration", () => {
   const base = snapshot();
-  const state = { ...base, stage: "defense", attackDeclaration: declaration(base) };
+  const state = withDeclaredAttack(base);
   const defense = makeActionMessage(state.roomId, state.revision, {
     type: "choose_defense",
     defenseMode: "block",
@@ -206,7 +294,9 @@ test("pending rolls can only be confirmed by the active attacker in the matching
     rng: createRng(settings.seed),
   });
   assert.equal(pending.hit, true);
-  const state = { ...base, stage: "resolution", pending };
+  const attacked = afterResolvedAttack(base);
+  const state = { ...attacked, stage: "resolution", pending };
+  assert.equal(isRoomSnapshot(state), true);
   const apply = makeActionMessage(state.roomId, state.revision, { type: "apply_pending" }, "request_apply_1");
   const finishMiss = makeActionMessage(state.roomId, state.revision, { type: "finish_miss" }, "request_miss_1");
   const anotherAttack = declareMessage(state);
@@ -232,17 +322,27 @@ test("guest rejects incomplete resolved attacks instead of rendering unsafe data
   });
   const invalidPending = structuredClone(pending);
   delete invalidPending.attackRoll;
-  const unsafe = { ...base, stage: "resolution", pending: invalidPending };
+  const attacked = afterResolvedAttack(base);
+  const unsafe = { ...attacked, stage: "resolution", pending: invalidPending };
   assert.equal(isRoomSnapshot(unsafe), false);
-  assert.equal(decodeHostMessage({ type: "snapshot", protocolVersion: 1, snapshot: unsafe }).ok, false);
+  assert.equal(decodeHostMessage({ type: "snapshot", protocolVersion: MULTIPLAYER_PROTOCOL_VERSION, snapshot: unsafe }).ok, false);
 });
 
 test("recover and pass are blocked while either player must respond", () => {
   const base = snapshot();
   const recover = makeActionMessage(base.roomId, base.revision, { type: "recover" }, "request_recover_1");
-  const declared = { ...base, stage: "defense", attackDeclaration: declaration(base) };
+  const pass = makeActionMessage(base.roomId, base.revision, { type: "pass" }, "request_pass_1");
+  const endTurn = makeActionMessage(base.roomId, base.revision, { type: "end_turn" }, "request_end_1");
+  const declared = withDeclaredAttack(base);
   assert.equal(validateClientMessage(recover, 1, declared).code, "pending_resolution_required");
   assert.equal(validateClientMessage(recover, 0, base).code, "not_your_turn");
+  assert.equal(validateClientMessage(endTurn, 1, base).code, "invalid_attack_sequence");
+
+  const afterFirstFast = afterResolvedAttack(base);
+  assert.equal(validateClientMessage(recover, 1, afterFirstFast).code, "invalid_attack_sequence");
+  assert.equal(validateClientMessage(pass, 1, afterFirstFast).code, "invalid_attack_sequence");
+  assert.deepEqual(validateClientMessage(endTurn, 1, afterFirstFast), { ok: true });
+  assert.equal(validateClientMessage(endTurn, 1, declared).code, "pending_resolution_required");
 });
 
 test("ready requires the sender's own prepared fighter slot", () => {

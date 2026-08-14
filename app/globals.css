@@ -175,6 +175,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .action-heading { border-bottom: 1px solid var(--line-soft); padding-bottom: 22px; margin-bottom: 25px; }
 .action-heading h2 { font: 700 30px/1 var(--serif); margin: 8px 0 10px; }
 .action-form { display: grid; gap: 16px; }
+.turn-sequence { display: grid; gap: 5px; padding: 13px 14px; border: 1px solid var(--line); border-left: 3px solid var(--copper); background: rgba(177,120,67,.06); }
+.turn-sequence b { font: 700 14px var(--serif); }
+.turn-sequence span, .attack-unavailable { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.turn-sequence-extra { border-left-color: var(--blood-bright); background: rgba(142,48,42,.08); }
+.attack-unavailable { margin: -5px 0 0; color: #d3a66e; }
 .action-form label, .seed-field { display: grid; gap: 7px; }
 .action-form label > span, .seed-field > span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; }
 .action-form select, .action-form input, .seed-field input { width: 100%; min-height: 43px; border: 1px solid var(--line); background: #0d0f0e; border-radius: 3px; padding: 0 12px; font-size: 12px; }
@@ -183,6 +188,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .button-roll { margin-top: 8px; min-height: 58px; font: 700 17px var(--serif); background: linear-gradient(180deg, #9d3b34, #70251f); border-color: #bd574e; color: #f4e8dc; }
 .button-roll:hover:not(:disabled) { background: linear-gradient(180deg, #b1473e, #822c25); border-color: #d26b61; }
 .button-roll span { margin-right: 9px; }
+.button-end-turn { min-height: 44px; background: transparent; border-color: var(--line); color: var(--muted); }
+.button-end-turn:hover:not(:disabled) { color: var(--text); border-color: var(--copper); }
 .secondary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .secondary-actions button { min-height: 38px; background: transparent; border: 1px solid var(--line-soft); color: var(--muted); font-size: 11px; }
 .result-card { text-align: center; padding: 30px 14px; }
@@ -294,7 +301,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .fighter-card { padding: 18px; }
   .fighter-state { grid-column: 2; justify-self: start; }
   .two-columns, .modifier-row { grid-template-columns: 1fr; }
-  .button-roll { position: sticky; bottom: 10px; z-index: 4; }
+  .button-roll { position: static; min-height: 58px; }
+  .button-end-turn, .secondary-actions button { min-height: 44px; }
   .log-panel { margin: 9px; padding: 18px 14px; }
   .log-panel > header { align-items: flex-start; flex-direction: column; }
   .log-filters { max-width: 100%; overflow: auto; }

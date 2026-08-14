@@ -1,7 +1,16 @@
 import type { CombatSettings, DefenseMode, LogEntry, PendingAttack, StrikeMode } from "./combat";
+import {
+  EXTRA_ATTACK_HIT_MODIFIER,
+  EXTRA_ATTACK_STAMINA_COST,
+  declareTurnAttack,
+  isAttackTurnState,
+  standardAttackComplete,
+  type AttackTurnError,
+  type AttackTurnState,
+} from "./turn-economy.ts";
 import type { LocationKey, PreparedFighter } from "./witcher";
 
-export const MULTIPLAYER_PROTOCOL_VERSION = 1 as const;
+export const MULTIPLAYER_PROTOCOL_VERSION = 2 as const;
 export const MAX_FIGHTER_MESSAGE_BYTES = 1_000_000;
 export const MAX_SNAPSHOT_MESSAGE_BYTES = 4_000_000;
 
@@ -17,6 +26,11 @@ export type AttackDeclaration = {
   locationChoice: LocationKey | "random";
   modifier: number;
   modifierNote: string;
+  /** Derived by the host from attackTurn; clients never send this value. */
+  extra: boolean;
+  /** Only the extra-action modifier. Strong-strike accuracy remains in combat.ts. */
+  automaticModifier: 0 | typeof EXTRA_ATTACK_HIT_MODIFIER;
+  staminaCost: 0 | typeof EXTRA_ATTACK_STAMINA_COST;
 };
 
 export type RoomPlayer = {
@@ -45,6 +59,7 @@ export type RoomSnapshot = {
   initiative: [number, number];
   round: number;
   turn: number;
+  attackTurn: AttackTurnState;
   attackDeclaration: AttackDeclaration | null;
   pending: PendingAttack | null;
   log: LogEntry[];
@@ -68,6 +83,7 @@ export type ClientAction =
   | { type: "choose_defense"; defenseMode: DefenseMode }
   | { type: "apply_pending" }
   | { type: "finish_miss" }
+  | { type: "end_turn" }
   | { type: "recover" }
   | { type: "pass" }
   | { type: "continue_battle" }
@@ -106,6 +122,8 @@ export type RejectionCode =
   | "players_not_ready"
   | "fighter_missing"
   | "unknown_weapon"
+  | "invalid_attack_sequence"
+  | "insufficient_stamina"
   | "pending_resolution_required"
   | "no_pending_attack"
   | "wrong_resolution";
@@ -140,6 +158,10 @@ export type ActionValidationResult =
   | { ok: true }
   | { ok: false; code: RejectionCode; message: string };
 
+export type DerivedAttackDeclarationResult =
+  | { ok: true; declaration: AttackDeclaration; attackTurn: AttackTurnState }
+  | { ok: false; code: AttackTurnError | "fighter_missing" };
+
 const ROOM_ID = /^[A-Za-z0-9_-]{4,128}$/;
 const REQUEST_ID = /^[A-Za-z0-9_.:-]{4,128}$/;
 const DEFENSE_MODES = new Set<DefenseMode>(["dodge", "reposition", "block", "none"]);
@@ -149,8 +171,25 @@ const PHASES = new Set<RoomPhase>(["setup", "combat", "complete"]);
 const STAGES = new Set<RoomStage>(["setup", "action", "defense", "resolution", "complete"]);
 const REJECTION_CODES = new Set<RejectionCode>([
   "invalid_message", "protocol_mismatch", "wrong_room", "stale_revision", "host_only", "wrong_phase", "not_your_turn",
-  "players_not_ready", "fighter_missing", "unknown_weapon", "pending_resolution_required", "no_pending_attack", "wrong_resolution",
+  "players_not_ready", "fighter_missing", "unknown_weapon", "invalid_attack_sequence", "insufficient_stamina",
+  "pending_resolution_required", "no_pending_attack", "wrong_resolution",
 ]);
+const COMBAT_SETTINGS_KEYS = new Set(["explodingDice", "armorAblation", "criticals", "aimedLocations", "stopAtZero", "seed"]);
+const ROOM_PLAYER_KEYS = new Set(["side", "connected", "ready"]);
+const ROOM_SNAPSHOT_KEYS = new Set([
+  "protocolVersion", "roomId", "revision", "phase", "stage", "players", "prepared", "fighters", "settings", "active",
+  "firstSide", "initiative", "round", "turn", "attackTurn", "attackDeclaration", "pending", "log",
+]);
+const DECLARE_ATTACK_ACTION_KEYS = new Set(["type", "weaponUid", "strikeMode", "locationChoice", "modifier", "modifierNote"]);
+const ATTACK_DECLARATION_KEYS = new Set([
+  "attacker", "defender", "weaponUid", "strikeMode", "locationChoice", "modifier", "modifierNote",
+  "extra", "automaticModifier", "staminaCost",
+]);
+const CLIENT_HELLO_KEYS = new Set(["type", "protocolVersion", "roomId", "requestId"]);
+const CLIENT_ACTION_MESSAGE_KEYS = new Set(["type", "protocolVersion", "roomId", "requestId", "expectedRevision", "action"]);
+const HOST_WELCOME_KEYS = new Set(["type", "protocolVersion", "side", "snapshot"]);
+const HOST_SNAPSHOT_KEYS = new Set(["type", "protocolVersion", "snapshot", "ackRequestId"]);
+const HOST_REJECTED_KEYS = new Set(["type", "protocolVersion", "code", "message", "requestId", "snapshot"]);
 const FIGHTER_STAT_KEYS = ["INT", "REF", "DEX", "BODY", "SPD", "EMP", "CRA", "WILL", "LUCK"] as const;
 const FIGHTER_KEYS = new Set([
   "id", "name", "race", "profession", "stats", "skills", "hp", "maxHp", "sta", "maxSta",
@@ -198,7 +237,7 @@ function jsonFits(value: unknown, maxBytes: number) {
 }
 
 function isCombatSettings(value: unknown): value is CombatSettings {
-  if (!isRecord(value)) return false;
+  if (!isRecord(value) || !hasOnlyKeys(value, COMBAT_SETTINGS_KEYS) || Object.keys(value).length !== COMBAT_SETTINGS_KEYS.size) return false;
   return typeof value.explodingDice === "boolean"
     && typeof value.armorAblation === "boolean"
     && typeof value.criticals === "boolean"
@@ -208,7 +247,9 @@ function isCombatSettings(value: unknown): value is CombatSettings {
 }
 
 function isDeclareAttackAction(value: Record<string, unknown>): value is DeclareAttackAction {
-  return value.type === "declare_attack"
+  return hasOnlyKeys(value, DECLARE_ATTACK_ACTION_KEYS)
+    && Object.keys(value).length === DECLARE_ATTACK_ACTION_KEYS.size
+    && value.type === "declare_attack"
     && isBoundedString(value.weaponUid, 256)
     && value.weaponUid.length > 0
     && STRIKE_MODES.has(value.strikeMode as StrikeMode)
@@ -221,19 +262,22 @@ function isDeclareAttackAction(value: Record<string, unknown>): value is Declare
 function isClientAction(value: unknown): value is ClientAction {
   if (!isRecord(value) || typeof value.type !== "string") return false;
   switch (value.type) {
-    case "submit_fighter": return isPreparedFighter(value.fighter) && jsonFits(value.fighter, MAX_FIGHTER_MESSAGE_BYTES);
-    case "set_ready": return typeof value.ready === "boolean";
-    case "set_settings": return isCombatSettings(value.settings);
+    case "submit_fighter": return hasOnlyKeys(value, new Set(["type", "fighter"])) && Object.keys(value).length === 2
+      && isPreparedFighter(value.fighter) && jsonFits(value.fighter, MAX_FIGHTER_MESSAGE_BYTES);
+    case "set_ready": return hasOnlyKeys(value, new Set(["type", "ready"])) && Object.keys(value).length === 2 && typeof value.ready === "boolean";
+    case "set_settings": return hasOnlyKeys(value, new Set(["type", "settings"])) && Object.keys(value).length === 2 && isCombatSettings(value.settings);
     case "declare_attack": return isDeclareAttackAction(value);
-    case "choose_defense": return DEFENSE_MODES.has(value.defenseMode as DefenseMode);
+    case "choose_defense": return hasOnlyKeys(value, new Set(["type", "defenseMode"])) && Object.keys(value).length === 2
+      && DEFENSE_MODES.has(value.defenseMode as DefenseMode);
     case "start_battle":
     case "apply_pending":
     case "finish_miss":
+    case "end_turn":
     case "recover":
     case "pass":
     case "continue_battle":
     case "reset_room":
-      return true;
+      return Object.keys(value).length === 1;
     default:
       return false;
   }
@@ -241,6 +285,8 @@ function isClientAction(value: unknown): value is ClientAction {
 
 function isRoomPlayer(value: unknown, expectedSide: Side): value is RoomPlayer {
   return isRecord(value)
+    && hasOnlyKeys(value, ROOM_PLAYER_KEYS)
+    && Object.keys(value).length === ROOM_PLAYER_KEYS.size
     && value.side === expectedSide
     && typeof value.connected === "boolean"
     && typeof value.ready === "boolean";
@@ -296,6 +342,8 @@ export function isPreparedFighter(value: unknown): value is PreparedFighter {
 
 function isAttackDeclaration(value: unknown): value is AttackDeclaration {
   return isRecord(value)
+    && hasOnlyKeys(value, ATTACK_DECLARATION_KEYS)
+    && Object.keys(value).length === ATTACK_DECLARATION_KEYS.size
     && isSide(value.attacker)
     && isSide(value.defender)
     && value.attacker !== value.defender
@@ -305,7 +353,10 @@ function isAttackDeclaration(value: unknown): value is AttackDeclaration {
     && LOCATIONS.has(value.locationChoice as LocationKey | "random")
     && Number.isSafeInteger(value.modifier)
     && Math.abs(value.modifier as number) <= 1_000
-    && isBoundedString(value.modifierNote, 500);
+    && isBoundedString(value.modifierNote, 500)
+    && typeof value.extra === "boolean"
+    && value.automaticModifier === (value.extra ? EXTRA_ATTACK_HIT_MODIFIER : 0)
+    && value.staminaCost === (value.extra ? EXTRA_ATTACK_STAMINA_COST : 0);
 }
 
 function isDiceRoll(value: unknown) {
@@ -355,7 +406,10 @@ function isLogEntry(value: unknown): value is LogEntry {
 }
 
 export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
-  if (!isRecord(value) || !jsonFits(value, MAX_SNAPSHOT_MESSAGE_BYTES)) return false;
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ROOM_SNAPSHOT_KEYS)
+    || Object.keys(value).length !== ROOM_SNAPSHOT_KEYS.size
+    || !jsonFits(value, MAX_SNAPSHOT_MESSAGE_BYTES)) return false;
   if (value.protocolVersion !== MULTIPLAYER_PROTOCOL_VERSION || typeof value.roomId !== "string" || !ROOM_ID.test(value.roomId)) return false;
   if (!isNonNegativeInteger(value.revision) || !PHASES.has(value.phase as RoomPhase) || !STAGES.has(value.stage as RoomStage)) return false;
   if (!Array.isArray(value.players) || value.players.length !== 2 || !isRoomPlayer(value.players[0], 0) || !isRoomPlayer(value.players[1], 1)) return false;
@@ -364,6 +418,7 @@ export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
   if (!isCombatSettings(value.settings) || !isSide(value.active) || !isSide(value.firstSide)) return false;
   if (!Array.isArray(value.initiative) || value.initiative.length !== 2 || !value.initiative.every(isFiniteNumber)) return false;
   if (!isNonNegativeInteger(value.round) || value.round < 1 || !isNonNegativeInteger(value.turn)) return false;
+  if (!isAttackTurnState(value.attackTurn)) return false;
   if (value.attackDeclaration !== null && !isAttackDeclaration(value.attackDeclaration)) return false;
   if (value.pending !== null && !isPendingAttack(value.pending)) return false;
   if (value.attackDeclaration !== null && value.pending !== null) return false;
@@ -377,7 +432,9 @@ export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
           ? "defense"
           : "action";
   if (value.stage !== expectedStage) return false;
-  if (value.phase === "setup" && (value.fighters !== null || value.attackDeclaration !== null || value.pending !== null)) return false;
+  const attackTurn = value.attackTurn as AttackTurnState;
+  if (value.phase === "setup" && (value.fighters !== null || value.attackDeclaration !== null || value.pending !== null
+    || attackTurn.standardMode !== null || attackTurn.standardStrikes !== 0 || attackTurn.extraUsed || attackTurn.ended)) return false;
   if (value.phase !== "setup" && value.fighters === null) return false;
   if (value.phase === "complete" && (value.attackDeclaration !== null || value.pending !== null)) return false;
   if (value.attackDeclaration) {
@@ -385,9 +442,14 @@ export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
     const fighters = value.fighters as [PreparedFighter, PreparedFighter] | null;
     if (declaration.attacker !== value.active
       || declaration.defender === value.active
-      || !fighters?.[declaration.attacker].weapons.some((weapon) => weapon.uid === declaration.weaponUid)) return false;
+      || !fighters?.[declaration.attacker].weapons.some((weapon) => weapon.uid === declaration.weaponUid)
+      || (declaration.extra
+        ? !attackTurn.extraUsed || !attackTurn.ended || !standardAttackComplete(attackTurn)
+        : attackTurn.extraUsed || attackTurn.ended || attackTurn.standardMode !== declaration.strikeMode)) return false;
   }
-  if (value.pending && value.pending.attacker !== value.active) return false;
+  if (value.pending && (value.pending.attacker !== value.active
+    || attackTurn.standardMode === null
+    || (!attackTurn.extraUsed && (attackTurn.ended || attackTurn.standardMode !== value.pending.strikeMode)))) return false;
   return Array.isArray(value.log) && value.log.length <= 10_000 && value.log.every(isLogEntry);
 }
 
@@ -399,8 +461,16 @@ export function decodeClientMessage(value: unknown): DecodeResult<ClientMessage>
   if (typeof value.roomId !== "string" || !ROOM_ID.test(value.roomId) || typeof value.requestId !== "string" || !REQUEST_ID.test(value.requestId)) {
     return { ok: false, code: "invalid_message", message: "Room or request identifier is invalid." };
   }
-  if (value.type === "hello" || value.type === "request_snapshot") return { ok: true, value: value as ClientMessage };
-  if (value.type !== "action" || !isNonNegativeInteger(value.expectedRevision) || !isClientAction(value.action)) {
+  if (value.type === "hello" || value.type === "request_snapshot") {
+    return hasOnlyKeys(value, CLIENT_HELLO_KEYS) && Object.keys(value).length === CLIENT_HELLO_KEYS.size
+      ? { ok: true, value: value as ClientMessage }
+      : { ok: false, code: "invalid_message", message: "Client message contains unexpected fields." };
+  }
+  if (value.type !== "action"
+    || !hasOnlyKeys(value, CLIENT_ACTION_MESSAGE_KEYS)
+    || Object.keys(value).length !== CLIENT_ACTION_MESSAGE_KEYS.size
+    || !isNonNegativeInteger(value.expectedRevision)
+    || !isClientAction(value.action)) {
     return { ok: false, code: "invalid_message", message: "Client action is invalid." };
   }
   if (!jsonFits(value, MAX_FIGHTER_MESSAGE_BYTES + 16_384)) {
@@ -414,11 +484,21 @@ export function decodeHostMessage(value: unknown): DecodeResult<HostMessage> {
   if (value.protocolVersion !== MULTIPLAYER_PROTOCOL_VERSION) {
     return { ok: false, code: "protocol_mismatch", message: `Protocol ${String(value.protocolVersion)} is not supported.` };
   }
-  if (value.type === "welcome" && isSide(value.side) && isRoomSnapshot(value.snapshot)) return { ok: true, value: value as HostMessage };
-  if (value.type === "snapshot" && isRoomSnapshot(value.snapshot) && (value.ackRequestId === undefined || (typeof value.ackRequestId === "string" && REQUEST_ID.test(value.ackRequestId)))) {
+  if (value.type === "welcome"
+    && hasOnlyKeys(value, HOST_WELCOME_KEYS)
+    && Object.keys(value).length === HOST_WELCOME_KEYS.size
+    && isSide(value.side)
+    && isRoomSnapshot(value.snapshot)) return { ok: true, value: value as HostMessage };
+  if (value.type === "snapshot"
+    && hasOnlyKeys(value, HOST_SNAPSHOT_KEYS)
+    && (Object.keys(value).length === 3 || Object.keys(value).length === 4)
+    && isRoomSnapshot(value.snapshot)
+    && (value.ackRequestId === undefined || (typeof value.ackRequestId === "string" && REQUEST_ID.test(value.ackRequestId)))) {
     return { ok: true, value: value as HostMessage };
   }
   if (value.type === "rejected"
+    && hasOnlyKeys(value, HOST_REJECTED_KEYS)
+    && Object.keys(value).length >= 4
     && REJECTION_CODES.has(value.code as RejectionCode)
     && isBoundedString(value.message, 2_000)
     && (value.requestId === undefined || (typeof value.requestId === "string" && REQUEST_ID.test(value.requestId)))
@@ -430,6 +510,44 @@ export function decodeHostMessage(value: unknown): DecodeResult<HostMessage> {
 
 function rejected(code: RejectionCode, message: string): ActionValidationResult {
   return { ok: false, code, message };
+}
+
+/**
+ * Derive the server-owned declaration fields and post-declaration turn state.
+ * Both host execution and validation should use this function so a client can
+ * never choose whether an attack is extra or bypass its cost and modifier.
+ */
+export function deriveAttackDeclaration(
+  snapshot: Pick<RoomSnapshot, "active" | "fighters" | "attackTurn">,
+  action: DeclareAttackAction,
+): DerivedAttackDeclarationResult {
+  const fighter = snapshot.fighters?.[snapshot.active];
+  if (!fighter) return { ok: false, code: "fighter_missing" };
+  const extra = standardAttackComplete(snapshot.attackTurn);
+  const economy = declareTurnAttack(snapshot.attackTurn, { strikeMode: action.strikeMode, extra }, fighter.sta);
+  if (!economy.ok) return economy;
+  return {
+    ok: true,
+    attackTurn: economy.state,
+    declaration: {
+      attacker: snapshot.active,
+      defender: snapshot.active === 0 ? 1 : 0,
+      weaponUid: action.weaponUid,
+      strikeMode: action.strikeMode,
+      locationChoice: action.locationChoice,
+      modifier: action.modifier,
+      modifierNote: action.modifierNote,
+      extra,
+      automaticModifier: economy.hitModifier,
+      staminaCost: economy.staminaCost,
+    },
+  };
+}
+
+function rejectedAttackEconomy(code: AttackTurnError | "fighter_missing"): ActionValidationResult {
+  if (code === "fighter_missing") return rejected("fighter_missing", "The active fighter is unavailable.");
+  if (code === "insufficient_stamina") return rejected("insufficient_stamina", "The fighter needs 3 STA for an extra attack.");
+  return rejected("invalid_attack_sequence", "That attack is not available in the current attack action.");
 }
 
 /** Validate authority and ordering after decodeClientMessage has accepted a message. */
@@ -469,11 +587,23 @@ export function validateClientMessage(message: ClientMessage, actor: Side, snaps
 
   if (action.type === "declare_attack") {
     if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
-    if (!snapshot.fighters[actor].weapons.some((weapon) => weapon.uid === action.weaponUid)) return rejected("unknown_weapon", "The selected weapon does not belong to the active fighter.");
-    return { ok: true };
+    const weapon = snapshot.fighters[actor].weapons.find((item) => item.uid === action.weaponUid);
+    if (!weapon) return rejected("unknown_weapon", "The selected weapon does not belong to the active fighter.");
+    if (!weapon.damage.trim()) return rejected("invalid_attack_sequence", "The selected weapon has no damage formula.");
+    const derived = deriveAttackDeclaration(snapshot, action);
+    return derived.ok ? { ok: true } : rejectedAttackEconomy(derived.code);
+  }
+  if (action.type === "end_turn") {
+    if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
+    return snapshot.attackTurn.standardMode === null
+      ? rejected("invalid_attack_sequence", "End an attack turn only after beginning an attack action.")
+      : { ok: true };
   }
   if (action.type === "recover" || action.type === "pass") {
-    return snapshot.pending || snapshot.attackDeclaration ? rejected("pending_resolution_required", "Resolve the current attack first.") : { ok: true };
+    if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
+    return snapshot.attackTurn.standardMode === null
+      ? { ok: true }
+      : rejected("invalid_attack_sequence", "Recovery and passing are unavailable after an attack action has begun.");
   }
   if (snapshot.attackDeclaration || !snapshot.pending || snapshot.pending.attacker !== actor) return rejected("no_pending_attack", "There is no resolved attack for this fighter to confirm.");
   if (action.type === "apply_pending" && !snapshot.pending.hit) return rejected("wrong_resolution", "A missed attack cannot apply damage.");

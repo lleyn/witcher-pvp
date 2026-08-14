@@ -88,3 +88,13 @@ test("strong strike doubles damage before armor and crit is added after location
   assert.equal(result.criticalBonus, 10);
   assert.equal(result.finalDamage, 40);
 });
+
+test("extra attack penalty combines with the strong attack penalty", () => {
+  const attacker = buildFighter(parseWitcherFile(demoCharacter("a"))[0].character);
+  const defender = buildFighter(parseWitcherFile(demoCharacter("b"))[0].character);
+  const weapon = { ...attacker.weapons[0], damage: "1d6" };
+  const fast = resolveAttack({ fighters: [attacker, defender], attacker: 0, weapon, defenseMode: "none", strikeMode: "normal", locationChoice: "torso", modifier: -3, settings, rng: () => 0.5 });
+  const strong = resolveAttack({ fighters: [attacker, defender], attacker: 0, weapon, defenseMode: "none", strikeMode: "strong", locationChoice: "torso", modifier: -3, settings, rng: () => 0.5 });
+  assert.equal(fast.attackModifier, -3);
+  assert.equal(strong.attackModifier, -6);
+});

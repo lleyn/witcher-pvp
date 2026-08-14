@@ -14,6 +14,9 @@ test("ships the Duel Ledger product surface", async () => {
   assert.match(entry, /<DuelApp \/>/);
   assert.match(app, /parseWitcherFile/);
   assert.match(app, /Бросить атаку/);
+  assert.match(app, /Быстрая \(до 2 за ход\)/);
+  assert.match(app, /Дополнительная атака/);
+  assert.match(app, /Для дополнительной атаки нужно 3 Выносливости/);
   assert.match(app, /Онлайн-комната/);
   assert.match(app, /choose_defense/);
   assert.match(app, /Копировать приглашение/);
