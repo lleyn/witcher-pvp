@@ -17,8 +17,8 @@ import {
   validateClientMessage,
 } from "../lib/multiplayer";
 import {
-  connectionErrorMessage, createRoomCode, inviteUrl, normalizeRoomCode, peerIdFromCode,
-  roomCodeFromHash, roomIdFromCode,
+  connectionErrorMessage, createHostKey, hostUrl, inviteUrl, normalizeRoomCode, peerIdFromCode,
+  roomCodeFromHostKey, roomIdFromCode, roomRouteFromHash,
 } from "../lib/peer-room";
 import {
   AttackTurnState, attackTurnOptions, createAttackTurnState, declareTurnAttack, standardAttackComplete,
@@ -45,7 +45,11 @@ import {
 
 type Phase = "setup" | "combat" | "complete";
 type ImportResult = { character: RawCharacter; warnings: string[]; importedFields: number };
-type Session = { kind: "local" | "online-menu" } | { kind: "host" | "guest"; code: string };
+type Session =
+  | { kind: "local" | "online-menu" }
+  | { kind: "host-loading"; hostKey: string }
+  | { kind: "host"; code: string; hostKey: string }
+  | { kind: "guest"; code: string };
 type NetworkStatus = "idle" | "connecting" | "waiting" | "connected" | "disconnected" | "error";
 type OwnedSource = { side: Side; character: RawCharacter };
 type PendingMonsterSpecial = {
@@ -499,8 +503,15 @@ function OnlineMenu({ joinCode, onJoinCode, onCreate, onJoin }: { joinCode: stri
   );
 }
 
-function ConnectionBar({ role, code, status, error, onCopy, copied, onRetry }: {
-  role: "host" | "guest"; code: string; status: NetworkStatus; error: string; onCopy: () => void; copied: boolean; onRetry: () => void;
+function ConnectionBar({ role, code, status, error, onCopyInvite, onCopyHost, copiedLink, onRetry }: {
+  role: "host" | "guest";
+  code: string;
+  status: NetworkStatus;
+  error: string;
+  onCopyInvite: () => void;
+  onCopyHost: () => void;
+  copiedLink: "invite" | "host" | null;
+  onRetry: () => void;
 }) {
   const statusLabel = status === "connected" ? "Соперник подключён" : status === "waiting" ? "Ожидаем соперника" : status === "connecting" ? "Соединяем…" : "Связь прервана";
   return (
@@ -508,7 +519,11 @@ function ConnectionBar({ role, code, status, error, onCopy, copied, onRetry }: {
       <span className="connection-dot" aria-hidden="true" />
       <div><span className="eyebrow">{role === "host" ? "Вы — боец A" : "Вы — боец B"}</span><b>{statusLabel}</b>{error && <small>{error}</small>}</div>
       <code>{code.toUpperCase()}</code>
-      {role === "host" && <button className="button button-quiet" type="button" onClick={onCopy}>{copied ? "Ссылка скопирована" : "Копировать приглашение"}</button>}
+      {role === "host" && <div className="connection-links" aria-live="polite">
+        <button className="button button-quiet" type="button" onClick={onCopyInvite}>{copiedLink === "invite" ? "Приглашение скопировано" : "Копировать приглашение"}</button>
+        <button className="button button-quiet button-owner-link" type="button" onClick={onCopyHost}>{copiedLink === "host" ? "Ссылка владельца скопирована" : "Копировать ссылку владельца"}</button>
+        <small>Приглашение отдайте игроку B. Ссылку владельца не пересылайте: она открывает комнату от имени бойца A.</small>
+      </div>}
       {(status === "error" || status === "disconnected") && <button className="button button-quiet" type="button" onClick={onRetry}>Подключиться снова</button>}
     </section>
   );
@@ -519,9 +534,12 @@ function WaitingAction({ title, detail }: { title: string; detail: string }) {
 }
 
 export default function DuelApp() {
-  const hashCode = typeof window === "undefined" ? "" : roomCodeFromHash(window.location.hash);
-  const [session, setSession] = useState<Session>(hashCode ? { kind: "guest", code: hashCode } : { kind: "local" });
-  const [joinCode, setJoinCode] = useState(hashCode);
+  const initialRoomRoute = typeof window === "undefined" ? null : roomRouteFromHash(window.location.hash);
+  const initialSession: Session = initialRoomRoute?.kind === "host"
+    ? { kind: "host-loading", hostKey: initialRoomRoute.hostKey }
+    : initialRoomRoute ?? { kind: "local" };
+  const [session, setSession] = useState<Session>(initialSession);
+  const [joinCode, setJoinCode] = useState(initialRoomRoute?.kind === "guest" ? initialRoomRoute.code : "");
   const [imports, setImports] = useState<[ImportResult | null, ImportResult | null]>([null, null]);
   const [prepared, setPrepared] = useState<[PreparedFighter | null, PreparedFighter | null]>([null, null]);
   const [fighters, setFighters] = useState<[PreparedFighter, PreparedFighter] | null>(null);
@@ -555,10 +573,10 @@ export default function DuelApp() {
   const [logFilter, setLogFilter] = useState<"all" | LogEntry["type"]>("all");
   const [revision, setRevision] = useState(0);
   const [players, setPlayers] = useState<RoomSnapshot["players"]>([{ side: 0, connected: true, ready: false }, { side: 1, connected: false, ready: false }]);
-  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>(hashCode ? "connecting" : "idle");
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>(initialRoomRoute ? "connecting" : "idle");
   const [networkError, setNetworkError] = useState("");
   const [guestSynced, setGuestSynced] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copiedLink, setCopiedLink] = useState<"invite" | "host" | null>(null);
   const [reconnectKey, setReconnectKey] = useState(0);
   const rngRef = useRef<() => number>(createRng(settings.seed));
   const peerRef = useRef<Peer | null>(null);
@@ -574,9 +592,31 @@ export default function DuelApp() {
   const connected = !online || networkStatus === "connected";
 
   useEffect(() => {
+    if (session.kind !== "host-loading") return;
+    let cancelled = false;
+    void roomCodeFromHostKey(session.hostKey).then((code) => {
+      if (cancelled || !code) return;
+      setJoinCode(code);
+      setSession({ kind: "host", code, hostKey: session.hostKey });
+      setNetworkStatus("connecting");
+    }).catch(() => {
+      if (cancelled) return;
+      setNetworkStatus("error");
+      setNetworkError("Не удалось прочитать ссылку владельца в этом браузере.");
+      setSession({ kind: "online-menu" });
+    });
+    return () => { cancelled = true; };
+  }, [session]);
+
+  useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (!saved) return;
     try { setSettings({ ...SETTINGS_DEFAULT, ...JSON.parse(saved) }); } catch { /* invalid local preference */ }
+  }, []);
+  useEffect(() => {
+    const reloadForRoomRoute = () => window.location.reload();
+    window.addEventListener("hashchange", reloadForRoomRoute);
+    return () => window.removeEventListener("hashchange", reloadForRoomRoute);
   }, []);
   useEffect(() => { if (session.kind !== "guest") localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); }, [settings, session.kind]);
   useEffect(() => {
@@ -843,7 +883,7 @@ export default function DuelApp() {
 
     function handleError(error: { type?: string; message?: string }) {
       if (disposed) return;
-      setNetworkStatus("error"); setNetworkError(connectionErrorMessage(error.type));
+      setNetworkStatus("error"); setNetworkError(connectionErrorMessage(error.type, isHost ? "host" : "guest"));
     }
 
     function closeConnection(connection: DataConnection) {
@@ -1383,7 +1423,7 @@ export default function DuelApp() {
   }
 
   function resetLocalState() {
-    setImports([null, null]); setPrepared([null, null]); setFighters(null); setEncounter(null); setPhase("setup"); setLog([]); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null); setMonsterCooldowns({}); setPendingMonsterSpecial(null); setActionTab("attack"); setActionMessage(""); setExportOpen(false); setRevision(0);
+    setImports([null, null]); setPrepared([null, null]); setFighters(null); setEncounter(null); setPhase("setup"); setLog([]); setAttackTurn(createAttackTurnState()); setPending(null); setAttackDeclaration(null); setMonsterCooldowns({}); setPendingMonsterSpecial(null); setActionTab("attack"); setActionMessage(""); setExportOpen(false); setCopiedLink(null); setRevision(0);
     snapshotRef.current = null; committingRevisionRef.current = null; seenRequestIdsRef.current.clear(); setGuestSynced(false);
   }
 
@@ -1404,23 +1444,35 @@ export default function DuelApp() {
     else setSettings(next);
   }
 
-  function enterOnlineMenu() { if (phase !== "setup") return; resetLocalState(); setEncounterMode("pvp"); setSession({ kind: "online-menu" }); setNetworkStatus("idle"); window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); }
-  function enterLocalMode() { resetLocalState(); setSession({ kind: "local" }); setNetworkStatus("idle"); window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); }
+  function enterOnlineMenu() { if (phase !== "setup") return; resetLocalState(); setEncounterMode("pvp"); setSession({ kind: "online-menu" }); setNetworkStatus("idle"); setNetworkError(""); window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); }
+  function enterLocalMode() { resetLocalState(); setSession({ kind: "local" }); setNetworkStatus("idle"); setNetworkError(""); window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); }
   function createOnline() {
     resetLocalState();
-    const code = createRoomCode(); setJoinCode(code); setSession({ kind: "host", code });
+    const hostKey = createHostKey();
+    setJoinCode(""); setSession({ kind: "host-loading", hostKey }); setNetworkStatus("connecting"); setNetworkError("");
     setPlayers([{ side: 0, connected: true, ready: false }, { side: 1, connected: false, ready: false }]);
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#join=${code}`);
+    window.history.replaceState(null, "", hostUrl(hostKey, window.location));
   }
   function joinOnline() {
     const code = normalizeRoomCode(joinCode);
     if (code.length !== 16) return;
     resetLocalState(); setSession({ kind: "guest", code });
     setPlayers([{ side: 0, connected: false, ready: false }, { side: 1, connected: true, ready: false }]);
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#join=${code}`);
+    window.history.replaceState(null, "", inviteUrl(code, window.location));
   }
   function leaveOnline() { peerRef.current?.destroy(); resetLocalState(); setSession({ kind: "local" }); setNetworkStatus("idle"); setNetworkError(""); window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); }
-  async function copyInvite() { if (!online) return; await navigator.clipboard.writeText(inviteUrl(session.code, window.location)); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }
+  async function copyRoomLink(kind: "invite" | "host") {
+    if (session.kind !== "host") return;
+    const link = kind === "invite" ? inviteUrl(session.code, window.location) : hostUrl(session.hostKey, window.location);
+    try {
+      await navigator.clipboard.writeText(link);
+    } catch {
+      window.prompt(kind === "invite" ? "Скопируйте приглашение для игрока B" : "Скопируйте приватную ссылку владельца", link);
+      return;
+    }
+    setCopiedLink(kind);
+    window.setTimeout(() => setCopiedLink((current) => current === kind ? null : current), 1800);
+  }
 
   const setupReady = prepared[0] !== null && prepared[1] !== null && (!online || networkStatus === "connected");
 
@@ -1431,7 +1483,9 @@ export default function DuelApp() {
         <div className="top-actions"><StatusPill phase={phase} />{session.kind !== "guest" && <button className="button button-quiet" type="button" onClick={() => setSettingsOpen(true)}>⚙ Настройки</button>}{fighters && <button className="button button-quiet" type="button" onClick={() => setExportOpen(true)}>↧ Экспорт</button>}<button className="button button-ghost" type="button" onClick={newBattle}>{session.kind === "guest" ? "Покинуть комнату" : "Новый бой"}</button></div>
       </header>
 
-      {phase === "setup" ? (
+      {session.kind === "host-loading" ? (
+        <section className="setup-screen"><div className="waiting-action room-link-loading"><span className="waiting-rune" aria-hidden="true">◇</span><span className="eyebrow">Ссылка владельца</span><h2>Открываем комнату…</h2><p>Проверяем ключ владельца и восстанавливаем роль бойца A.</p></div></section>
+      ) : phase === "setup" ? (
         <section className="setup-screen">
           <div className="intro-copy"><span className="eyebrow">Листы против кубов</span><h2>Каждый управляет<br />своим персонажем.</h2><p>Играйте на одном экране или создайте онлайн-комнату для двух устройств.</p></div>
           <div className="mode-switch" role="group" aria-label="Режим боя"><button className={session.kind === "local" ? "active" : ""} type="button" onClick={enterLocalMode}>На одном экране</button><button className={session.kind !== "local" ? "active" : ""} type="button" onClick={enterOnlineMenu}>Онлайн с другом</button></div>
@@ -1440,7 +1494,8 @@ export default function DuelApp() {
             <label><span>Поле боя</span><select value={presetId} onChange={(event) => setPresetId(event.target.value as BattlefieldPresetId)}>{Object.entries(BATTLEFIELD_PRESETS).map(([id, preset]) => <option value={id} key={id}>{preset.name} · {preset.description}</option>)}</select></label>
           </div>}
           {session.kind === "online-menu" && <OnlineMenu joinCode={joinCode} onJoinCode={setJoinCode} onCreate={createOnline} onJoin={joinOnline} />}
-          {online && <ConnectionBar role={session.kind} code={session.code} status={networkStatus} error={networkError} copied={copied} onCopy={() => void copyInvite()} onRetry={() => setReconnectKey((value) => value + 1)} />}
+          {session.kind === "online-menu" && networkError && <p className="error" role="alert">{networkError}</p>}
+          {online && <ConnectionBar role={session.kind} code={session.code} status={networkStatus} error={networkError} copiedLink={copiedLink} onCopyInvite={() => void copyRoomLink("invite")} onCopyHost={() => void copyRoomLink("host")} onRetry={() => setReconnectKey((value) => value + 1)} />}
           {session.kind !== "online-menu" && <>
             <div className="import-grid">
               {online && ownSide !== 0 ? <RemoteFighterCard fighter={prepared[0]} side={0} connected={networkStatus === "connected"} /> : <ImportCard side={0} result={imports[0]} onImport={importResult} onDemo={loadDemo} />}
@@ -1454,7 +1509,7 @@ export default function DuelApp() {
         </section>
       ) : fighters ? (
         <>
-          {online && <ConnectionBar role={session.kind as "host" | "guest"} code={session.code} status={networkStatus} error={networkError} copied={copied} onCopy={() => void copyInvite()} onRetry={() => setReconnectKey((value) => value + 1)} />}
+          {online && <ConnectionBar role={session.kind as "host" | "guest"} code={session.code} status={networkStatus} error={networkError} copiedLink={copiedLink} onCopyInvite={() => void copyRoomLink("invite")} onCopyHost={() => void copyRoomLink("host")} onRetry={() => setReconnectKey((value) => value + 1)} />}
           <nav className="combat-strip" aria-label="Состояние боя"><span><small>Раунд</small><b>{round}</b></span><span><small>Ход</small><b>{fighters[active].name}</b></span><div className="initiative-line"><small>Инициатива</small>{([0, 1] as Side[]).sort((a, b) => initiative[b] - initiative[a]).map((side) => <span className={side === active ? "initiative-active" : ""} key={side}>{fighters[side].name} <b>{initiative[side]}</b></span>)}</div></nav>
           {encounter && <div className="battlefield-shell"><BattlefieldView encounter={encounter} fighters={fighters} /></div>}
           <section className="combat-grid">

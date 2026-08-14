@@ -88,6 +88,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .connection-bar b { font: 700 14px var(--serif); }
 .connection-bar small { color: #d7a077; font-size: 10px; line-height: 1.35; }
 .connection-bar code { color: var(--copper-bright); padding: 8px 10px; border: 1px solid var(--line-soft); background: #0b0d0c; letter-spacing: .11em; font-size: 11px; }
+.connection-bar > .connection-links { display: grid; grid-template-columns: repeat(2, minmax(0, auto)); gap: 7px; }
+.connection-links small { grid-column: 1 / -1; max-width: 390px; color: var(--faint); }
+.button-owner-link { border-color: rgba(177,120,67,.65); color: var(--copper-bright); }
 .import-grid { display: grid; grid-template-columns: minmax(0, 1fr) 64px minmax(0, 1fr); align-items: center; gap: 17px; }
 .import-card { min-height: 365px; text-align: left; border: 1px solid var(--line); background: linear-gradient(145deg, rgba(28,31,28,.96), rgba(18,21,19,.96)); padding: 20px; border-radius: 6px; box-shadow: var(--shadow); position: relative; }
 .import-card::before, .fighter-card::before, .action-panel::before { content: ""; position: absolute; inset: 7px; border: 1px solid rgba(177,120,67,.10); pointer-events: none; }
@@ -288,6 +291,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @keyframes pulse { 50% { opacity: .4; } }
 
 @media (max-width: 1080px) {
+  .connection-bar { grid-template-columns: auto minmax(180px, 1fr) auto; }
+  .connection-bar > .connection-links { grid-column: 2 / -1; width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .connection-bar > .button { grid-column: 2 / -1; }
   .combat-grid { grid-template-columns: 1fr 1fr; }
   .action-panel { grid-column: 1 / -1; grid-row: 1; min-height: auto; }
   .fighter-card { min-height: 0; }
@@ -309,6 +315,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .connection-bar { width: calc(100% - 18px); grid-template-columns: auto 1fr; margin: 9px auto 14px; }
   .setup-screen > .connection-bar { width: 100%; }
   .connection-bar code, .connection-bar > .button { grid-column: 1 / -1; width: 100%; }
+  .connection-bar > .connection-links { grid-column: 1 / -1; width: 100%; grid-template-columns: 1fr; }
+  .connection-links .button { width: 100%; }
+  .connection-links small { grid-column: 1; max-width: none; }
   .import-grid { grid-template-columns: 1fr; }
   .swap-button { margin: -8px auto; transform: rotate(90deg); }
   .swap-button span { display: none; }
