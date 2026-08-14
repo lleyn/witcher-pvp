@@ -125,6 +125,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .waiting-rune { color: var(--copper-bright); font-size: 38px; }
 .versus-seal { width: 54px; height: 54px; border-radius: 50%; border: 1px solid var(--copper); background: var(--surface); display: grid; place-items: center; color: var(--copper-bright); font: 700 13px var(--serif); z-index: 2; }
 .guest-wait-note { margin: 26px auto 0; padding: 12px 18px; width: fit-content; border: 1px solid var(--line-soft); background: rgba(17,20,18,.8); }
+.encounter-setup-bar { max-width: 900px; margin: 0 auto 28px; display: grid; grid-template-columns: auto minmax(280px, 1fr); gap: 18px; align-items: end; }
+.encounter-mode-switch { margin: 0; }
+.encounter-setup-bar > label { display: grid; gap: 7px; text-align: left; }
+.encounter-setup-bar > label span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; }
+.encounter-setup-bar select { min-height: 47px; width: 100%; border: 1px solid var(--line); background: #0d0f0e; padding: 0 12px; border-radius: 4px; font-size: 11px; }
+.monster-picker { min-height: 365px; border-radius: 6px; box-shadow: var(--shadow); }
 
 .combat-strip { min-height: 63px; padding: 10px clamp(20px, 4vw, 64px); border-bottom: 1px solid var(--line); display: flex; gap: 34px; align-items: center; background: #101210; }
 .combat-strip > span { display: flex; flex-direction: column; min-width: 75px; }
@@ -134,6 +140,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .initiative-line span { padding: 8px 12px; border: 1px solid var(--line-soft); border-radius: 3px; color: var(--muted); font-size: 11px; }
 .initiative-line span b { margin-left: 8px; color: var(--text); }
 .initiative-line .initiative-active { border-color: var(--copper); color: var(--text); background: rgba(177,120,67,.08); }
+.battlefield-shell { max-width: 1630px; margin: 15px auto 0; padding: 0 15px; }
+.battlefield-view { box-shadow: 0 14px 40px rgba(0,0,0,.26); }
 .combat-grid { display: grid; grid-template-columns: minmax(280px, 340px) minmax(440px, 1fr) minmax(280px, 340px); gap: 15px; padding: 15px; max-width: 1660px; margin: 0 auto; align-items: start; }
 .fighter-card, .action-panel, .log-panel { border: 1px solid var(--line); background: rgba(20,23,21,.94); position: relative; box-shadow: var(--shadow); }
 .fighter-card { padding: 21px; min-height: 720px; }
@@ -170,6 +178,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .weapon-list small { display: block; color: var(--faint); margin-top: 3px; }
 .weapon-list b { color: var(--copper-bright); }
 .warnings-block p { color: #d3a66e; font-size: 10px; line-height: 1.4; }
+.fighter-effects { border-top: 1px solid var(--line-soft); padding-top: 16px; margin-top: 6px; }
 
 .action-panel { min-height: 720px; padding: clamp(24px, 3vw, 43px); }
 .action-heading { border-bottom: 1px solid var(--line-soft); padding-bottom: 22px; margin-bottom: 25px; }
@@ -192,6 +201,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .button-end-turn:hover:not(:disabled) { color: var(--text); border-color: var(--copper); }
 .secondary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .secondary-actions button { min-height: 38px; background: transparent; border: 1px solid var(--line-soft); color: var(--muted); font-size: 11px; }
+.field-context { color: var(--muted); background: rgba(113,134,93,.08); border-left: 2px solid var(--moss); padding: 10px 12px; font-size: 10px; line-height: 1.45; margin: 0; }
+.auto-defense-note { display: grid; gap: 7px; align-content: center; min-height: 43px; padding: 8px 12px; border: 1px solid var(--line); background: rgba(113,134,93,.06); }
+.auto-defense-note span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .09em; }
+.auto-defense-note b { font-size: 11px; color: #b3c59f; }
+.extended-action-panel nav button { white-space: nowrap; font-size: 10px; }
+.monster-turn-card { min-height: 630px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; }
+.monster-turn-card h2 { font: 700 42px/1 var(--serif); margin: 8px 0 14px; }
+.monster-turn-card p { color: var(--muted); max-width: 430px; font-size: 12px; line-height: 1.6; }
+.monster-turn-card .button { width: min(390px, 100%); }
 .result-card { text-align: center; padding: 30px 14px; }
 .result-symbol { width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center; margin: 0 auto 19px; font-size: 28px; border: 1px solid var(--moss); color: #aabc93; background: rgba(113,134,93,.09); }
 .result-miss .result-symbol { border-color: var(--faint); color: var(--muted); background: transparent; }
@@ -284,6 +302,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .intro-copy h2 { font-size: 39px; }
   .mode-switch { width: 100%; }
   .mode-switch button { min-width: 0; padding-inline: 10px; }
+  .encounter-setup-bar { grid-template-columns: 1fr; }
+  .encounter-mode-switch { width: 100%; }
   .online-menu-card { grid-template-columns: 1fr; text-align: center; }
   .online-menu-card > .button { width: 100%; }
   .connection-bar { width: calc(100% - 18px); grid-template-columns: auto 1fr; margin: 9px auto 14px; }
@@ -296,11 +316,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .combat-strip { position: sticky; top: 0; z-index: 10; padding: 9px 14px; gap: 18px; }
   .initiative-line { display: none; }
   .combat-grid { grid-template-columns: 1fr; padding: 9px; }
+  .battlefield-shell { padding: 0 9px; margin-top: 9px; }
   .action-panel { grid-column: auto; grid-row: 1; padding: 24px 16px; }
   .waiting-action, .defense-card { min-height: 430px; }
   .fighter-card { padding: 18px; }
   .fighter-state { grid-column: 2; justify-self: start; }
   .two-columns, .modifier-row { grid-template-columns: 1fr; }
+  .extended-action-panel nav { grid-template-columns: repeat(2, 1fr) !important; }
   .button-roll { position: static; min-height: 58px; }
   .button-end-turn, .secondary-actions button { min-height: 44px; }
   .log-panel { margin: 9px; padding: 18px 14px; }

@@ -26,6 +26,7 @@ export type PendingAttack = {
   attackBase: number;
   defenseBase: number;
   attackModifier: number;
+  defenseModifier: number;
   aimedModifier: number;
   attackTotal: number;
   defenseTotal: number;
@@ -139,9 +140,12 @@ export function defenseBase(fighter: PreparedFighter, mode: DefenseMode, weapon?
 
 export function resolveAttack(args: {
   fighters: [PreparedFighter, PreparedFighter]; attacker: 0 | 1; weapon: Weapon; defenseMode: DefenseMode; strikeMode: StrikeMode;
-  locationChoice: LocationKey | "random"; modifier: number; settings: CombatSettings; rng: () => number;
+  locationChoice: LocationKey | "random"; modifier: number; attackerModifier?: number; defenderModifier?: number;
+  settings: CombatSettings; rng: () => number;
 }): PendingAttack {
   const { fighters, attacker, weapon, defenseMode, strikeMode, locationChoice, modifier, settings, rng } = args;
+  const attackerModifier = args.attackerModifier ?? 0;
+  const defenderModifier = args.defenderModifier ?? 0;
   const defender = attacker === 0 ? 1 : 0;
   const source = fighters[attacker];
   const target = fighters[defender];
@@ -153,8 +157,8 @@ export function resolveAttack(args: {
   const strikeModifier = strikeMode === "strong" ? -3 : 0;
   const baseA = attackBase(source, weapon) + weapon.accuracy;
   const baseD = defenseBase(target, defenseMode, target.weapons[0]);
-  const attackTotal = Math.max(0, baseA + modifier + aimedModifier + strikeModifier + attackRoll.total);
-  const defenseTotal = defenseMode === "none" ? 10 : Math.max(0, baseD + (defenseRoll?.total ?? 0));
+  const attackTotal = Math.max(0, baseA + modifier + attackerModifier + aimedModifier + strikeModifier + attackRoll.total);
+  const defenseTotal = defenseMode === "none" ? 10 : Math.max(0, baseD + defenderModifier + (defenseRoll?.total ?? 0));
   const hit = attackTotal > defenseTotal;
   const margin = attackTotal - defenseTotal;
   const damageRoll = hit ? rollExpression(weapon.damage, rng) : null;
@@ -172,7 +176,7 @@ export function resolveAttack(args: {
     ? `${damageRoll?.text ?? "0"}${bodyBonus ? ` ${bodyBonus > 0 ? "+" : "−"} Бонус ТЕЛ ${Math.abs(bodyBonus)}` : ""}${strikeMode === "strong" ? " × 2" : ""} − броня ${appliedArmorSp}; зона ×${multiplier} + крит ${critical.bonus} = ${finalDamage}`
     : `Атака ${attackTotal} ≤ защита ${defenseTotal}`;
   return { attacker, defender, weapon, defenseMode, strikeMode, location, attackRoll, defenseRoll, attackBase: baseA,
-    defenseBase: baseD, attackModifier: modifier + strikeModifier, aimedModifier, attackTotal, defenseTotal, hit, margin,
+    defenseBase: baseD, attackModifier: modifier + attackerModifier + strikeModifier, defenseModifier: defenderModifier, aimedModifier, attackTotal, defenseTotal, hit, margin,
     damageRoll, rolledDamage, armorSp, appliedArmorSp, multiplier, normalDamage, criticalBonus: critical.bonus,
     criticalLevel: critical.level, finalDamage, formula };
 }

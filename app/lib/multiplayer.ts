@@ -1,4 +1,8 @@
 import type { CombatSettings, DefenseMode, LogEntry, PendingAttack, StrikeMode } from "./combat";
+import { isPhysicalActionDeclaration, validatePhysicalAction, type PhysicalActionDeclaration } from "./battlefield";
+import { isEncounterState, type EncounterState } from "./encounter";
+import { canFighterUseMagicAbility, findMagicAbility, validateMagicDeclaration } from "./magic";
+import { combinedCombatModifiers, weaponAttackContext } from "./rules-engine";
 import {
   EXTRA_ATTACK_HIT_MODIFIER,
   EXTRA_ATTACK_STAMINA_COST,
@@ -10,7 +14,7 @@ import {
 } from "./turn-economy.ts";
 import type { LocationKey, PreparedFighter } from "./witcher";
 
-export const MULTIPLAYER_PROTOCOL_VERSION = 2 as const;
+export const MULTIPLAYER_PROTOCOL_VERSION = 3 as const;
 export const MAX_FIGHTER_MESSAGE_BYTES = 1_000_000;
 export const MAX_SNAPSHOT_MESSAGE_BYTES = 4_000_000;
 
@@ -31,6 +35,9 @@ export type AttackDeclaration = {
   /** Only the extra-action modifier. Strong-strike accuracy remains in combat.ts. */
   automaticModifier: 0 | typeof EXTRA_ATTACK_HIT_MODIFIER;
   staminaCost: 0 | typeof EXTRA_ATTACK_STAMINA_COST;
+  contextAttackModifier: number;
+  contextDefenseModifier: number;
+  contextNote: string;
 };
 
 export type RoomPlayer = {
@@ -62,6 +69,7 @@ export type RoomSnapshot = {
   attackTurn: AttackTurnState;
   attackDeclaration: AttackDeclaration | null;
   pending: PendingAttack | null;
+  encounter: EncounterState | null;
   log: LogEntry[];
 };
 
@@ -83,6 +91,9 @@ export type ClientAction =
   | { type: "choose_defense"; defenseMode: DefenseMode }
   | { type: "apply_pending" }
   | { type: "finish_miss" }
+  | { type: "physical_action"; declaration: PhysicalActionDeclaration }
+  | { type: "cast_magic"; abilityId: string; target: Side }
+  | { type: "stabilize_wound"; woundId: string }
   | { type: "end_turn" }
   | { type: "recover" }
   | { type: "pass" }
@@ -125,6 +136,7 @@ export type RejectionCode =
   | "invalid_attack_sequence"
   | "insufficient_stamina"
   | "pending_resolution_required"
+  | "invalid_encounter_action"
   | "no_pending_attack"
   | "wrong_resolution";
 
@@ -160,7 +172,7 @@ export type ActionValidationResult =
 
 export type DerivedAttackDeclarationResult =
   | { ok: true; declaration: AttackDeclaration; attackTurn: AttackTurnState }
-  | { ok: false; code: AttackTurnError | "fighter_missing" };
+  | { ok: false; code: AttackTurnError | "fighter_missing" | "invalid_position" };
 
 const ROOM_ID = /^[A-Za-z0-9_-]{4,128}$/;
 const REQUEST_ID = /^[A-Za-z0-9_.:-]{4,128}$/;
@@ -172,18 +184,18 @@ const STAGES = new Set<RoomStage>(["setup", "action", "defense", "resolution", "
 const REJECTION_CODES = new Set<RejectionCode>([
   "invalid_message", "protocol_mismatch", "wrong_room", "stale_revision", "host_only", "wrong_phase", "not_your_turn",
   "players_not_ready", "fighter_missing", "unknown_weapon", "invalid_attack_sequence", "insufficient_stamina",
-  "pending_resolution_required", "no_pending_attack", "wrong_resolution",
+  "pending_resolution_required", "invalid_encounter_action", "no_pending_attack", "wrong_resolution",
 ]);
 const COMBAT_SETTINGS_KEYS = new Set(["explodingDice", "armorAblation", "criticals", "aimedLocations", "stopAtZero", "seed"]);
 const ROOM_PLAYER_KEYS = new Set(["side", "connected", "ready"]);
 const ROOM_SNAPSHOT_KEYS = new Set([
   "protocolVersion", "roomId", "revision", "phase", "stage", "players", "prepared", "fighters", "settings", "active",
-  "firstSide", "initiative", "round", "turn", "attackTurn", "attackDeclaration", "pending", "log",
+  "firstSide", "initiative", "round", "turn", "attackTurn", "attackDeclaration", "pending", "encounter", "log",
 ]);
 const DECLARE_ATTACK_ACTION_KEYS = new Set(["type", "weaponUid", "strikeMode", "locationChoice", "modifier", "modifierNote"]);
 const ATTACK_DECLARATION_KEYS = new Set([
   "attacker", "defender", "weaponUid", "strikeMode", "locationChoice", "modifier", "modifierNote",
-  "extra", "automaticModifier", "staminaCost",
+  "extra", "automaticModifier", "staminaCost", "contextAttackModifier", "contextDefenseModifier", "contextNote",
 ]);
 const CLIENT_HELLO_KEYS = new Set(["type", "protocolVersion", "roomId", "requestId"]);
 const CLIENT_ACTION_MESSAGE_KEYS = new Set(["type", "protocolVersion", "roomId", "requestId", "expectedRevision", "action"]);
@@ -192,17 +204,18 @@ const HOST_SNAPSHOT_KEYS = new Set(["type", "protocolVersion", "snapshot", "ackR
 const HOST_REJECTED_KEYS = new Set(["type", "protocolVersion", "code", "message", "requestId", "snapshot"]);
 const FIGHTER_STAT_KEYS = ["INT", "REF", "DEX", "BODY", "SPD", "EMP", "CRA", "WILL", "LUCK"] as const;
 const FIGHTER_KEYS = new Set([
-  "id", "name", "race", "profession", "stats", "skills", "hp", "maxHp", "sta", "maxSta",
-  "stun", "rec", "run", "leap", "initiativeBase", "meleeDamageBonus", "armor", "weapons", "warnings",
+  "id", "name", "race", "profession", "stats", "skills", "hp", "maxHp", "sta", "maxSta", "vigor", "maxVigor",
+  "resolve", "maxResolve", "stun", "rec", "run", "leap", "initiativeBase", "meleeDamageBonus", "armor", "weapons", "magic", "warnings",
 ]);
 const WEAPON_KEYS = new Set([
   "uid", "name", "category", "damage", "accuracy", "reliability", "range", "equipped", "effects", "attackSkill", "bodyDamage",
 ]);
+const MAGIC_REF_KEYS = new Set(["id", "name", "kind"]);
 const ARMOR_ZONE_KEYS = new Set(["sp", "originalSp", "source", "natural"]);
 const DICE_ROLL_KEYS = new Set(["rolls", "total", "text"]);
 const PENDING_ATTACK_KEYS = new Set([
   "attacker", "defender", "weapon", "defenseMode", "strikeMode", "location", "attackRoll", "defenseRoll",
-  "attackBase", "defenseBase", "attackModifier", "aimedModifier", "attackTotal", "defenseTotal", "hit", "margin",
+  "attackBase", "defenseBase", "attackModifier", "defenseModifier", "aimedModifier", "attackTotal", "defenseTotal", "hit", "margin",
   "damageRoll", "rolledDamage", "armorSp", "appliedArmorSp", "multiplier", "normalDamage", "criticalBonus",
   "criticalLevel", "finalDamage", "formula",
 ]);
@@ -269,6 +282,12 @@ function isClientAction(value: unknown): value is ClientAction {
     case "declare_attack": return isDeclareAttackAction(value);
     case "choose_defense": return hasOnlyKeys(value, new Set(["type", "defenseMode"])) && Object.keys(value).length === 2
       && DEFENSE_MODES.has(value.defenseMode as DefenseMode);
+    case "physical_action": return hasOnlyKeys(value, new Set(["type", "declaration"])) && Object.keys(value).length === 2
+      && isPhysicalActionDeclaration(value.declaration);
+    case "cast_magic": return hasOnlyKeys(value, new Set(["type", "abilityId", "target"])) && Object.keys(value).length === 3
+      && isBoundedString(value.abilityId, 128) && value.abilityId.length > 0 && isSide(value.target);
+    case "stabilize_wound": return hasOnlyKeys(value, new Set(["type", "woundId"])) && Object.keys(value).length === 2
+      && isBoundedString(value.woundId, 128) && value.woundId.length > 0;
     case "start_battle":
     case "apply_pending":
     case "finish_miss":
@@ -333,8 +352,14 @@ export function isPreparedFighter(value: unknown): value is PreparedFighter {
   const stats = value.stats;
   if (!isRecord(stats) || Object.keys(stats).length !== FIGHTER_STAT_KEYS.length || !FIGHTER_STAT_KEYS.every((key) => isFiniteNumber(stats[key]))) return false;
   if (!isRecord(value.skills) || Object.keys(value.skills).length > 500 || !Object.entries(value.skills).every(([key, score]) => /^[A-Za-z0-9_-]{1,100}$/.test(key) && isFiniteNumber(score))) return false;
-  if (![value.hp, value.maxHp, value.sta, value.maxSta, value.stun, value.rec, value.run, value.leap, value.initiativeBase, value.meleeDamageBonus].every(isFiniteNumber)) return false;
+  if (![value.hp, value.maxHp, value.sta, value.maxSta, value.vigor, value.maxVigor, value.resolve, value.maxResolve, value.stun, value.rec, value.run, value.leap, value.initiativeBase, value.meleeDamageBonus].every(isFiniteNumber)) return false;
   if (!isArmor(value.armor) || !Array.isArray(value.weapons) || value.weapons.length > 100 || !value.weapons.every(isWeapon)) return false;
+  if (!Array.isArray(value.magic) || value.magic.length > 100 || !value.magic.every((entry) => isRecord(entry)
+    && hasOnlyKeys(entry, MAGIC_REF_KEYS)
+    && Object.keys(entry).length === MAGIC_REF_KEYS.size
+    && isBoundedString(entry.id, 256)
+    && isBoundedString(entry.name, 500)
+    && ["sign", "spell", "invocation", "ritual", "hex"].includes(entry.kind as string))) return false;
   return Array.isArray(value.warnings)
     && value.warnings.length <= 100
     && value.warnings.every((warning) => isBoundedString(warning, 2_000));
@@ -356,7 +381,10 @@ function isAttackDeclaration(value: unknown): value is AttackDeclaration {
     && isBoundedString(value.modifierNote, 500)
     && typeof value.extra === "boolean"
     && value.automaticModifier === (value.extra ? EXTRA_ATTACK_HIT_MODIFIER : 0)
-    && value.staminaCost === (value.extra ? EXTRA_ATTACK_STAMINA_COST : 0);
+    && value.staminaCost === (value.extra ? EXTRA_ATTACK_STAMINA_COST : 0)
+    && isFiniteNumber(value.contextAttackModifier)
+    && isFiniteNumber(value.contextDefenseModifier)
+    && isBoundedString(value.contextNote, 1_000);
 }
 
 function isDiceRoll(value: unknown) {
@@ -373,7 +401,7 @@ function isDiceRoll(value: unknown) {
 function isPendingAttack(value: unknown): value is PendingAttack {
   if (!isRecord(value) || !hasOnlyKeys(value, PENDING_ATTACK_KEYS) || Object.keys(value).length !== PENDING_ATTACK_KEYS.size) return false;
   const numericFields = [
-    value.attackBase, value.defenseBase, value.attackModifier, value.aimedModifier, value.attackTotal, value.defenseTotal,
+    value.attackBase, value.defenseBase, value.attackModifier, value.defenseModifier, value.aimedModifier, value.attackTotal, value.defenseTotal,
     value.margin, value.rolledDamage, value.armorSp, value.appliedArmorSp, value.multiplier, value.normalDamage,
     value.criticalBonus, value.finalDamage,
   ];
@@ -421,6 +449,7 @@ export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
   if (!isAttackTurnState(value.attackTurn)) return false;
   if (value.attackDeclaration !== null && !isAttackDeclaration(value.attackDeclaration)) return false;
   if (value.pending !== null && !isPendingAttack(value.pending)) return false;
+  if (value.encounter !== null && !isEncounterState(value.encounter)) return false;
   if (value.attackDeclaration !== null && value.pending !== null) return false;
   const expectedStage: RoomStage = value.phase === "setup"
     ? "setup"
@@ -433,9 +462,10 @@ export function isRoomSnapshot(value: unknown): value is RoomSnapshot {
           : "action";
   if (value.stage !== expectedStage) return false;
   const attackTurn = value.attackTurn as AttackTurnState;
-  if (value.phase === "setup" && (value.fighters !== null || value.attackDeclaration !== null || value.pending !== null
+  if (value.phase === "setup" && (value.fighters !== null || value.encounter !== null || value.attackDeclaration !== null || value.pending !== null
     || attackTurn.standardMode !== null || attackTurn.standardStrikes !== 0 || attackTurn.extraUsed || attackTurn.ended)) return false;
-  if (value.phase !== "setup" && value.fighters === null) return false;
+  if (value.phase !== "setup" && (value.fighters === null || value.encounter === null)) return false;
+  if (value.encounter && (value.encounter.battlefield.turn.active !== value.active || value.encounter.magic.round !== value.round)) return false;
   if (value.phase === "complete" && (value.attackDeclaration !== null || value.pending !== null)) return false;
   if (value.attackDeclaration) {
     const declaration = value.attackDeclaration as AttackDeclaration;
@@ -518,11 +548,15 @@ function rejected(code: RejectionCode, message: string): ActionValidationResult 
  * never choose whether an attack is extra or bypass its cost and modifier.
  */
 export function deriveAttackDeclaration(
-  snapshot: Pick<RoomSnapshot, "active" | "fighters" | "attackTurn">,
+  snapshot: Pick<RoomSnapshot, "active" | "fighters" | "attackTurn" | "encounter">,
   action: DeclareAttackAction,
 ): DerivedAttackDeclarationResult {
   const fighter = snapshot.fighters?.[snapshot.active];
-  if (!fighter) return { ok: false, code: "fighter_missing" };
+  if (!fighter || !snapshot.fighters || !snapshot.encounter) return { ok: false, code: "fighter_missing" };
+  const weapon = fighter.weapons.find((item) => item.uid === action.weaponUid);
+  if (!weapon) return { ok: false, code: "fighter_missing" };
+  const context = weaponAttackContext(snapshot.encounter, snapshot.fighters, snapshot.active, weapon);
+  if (!context.ok) return { ok: false, code: "invalid_position" };
   const extra = standardAttackComplete(snapshot.attackTurn);
   const economy = declareTurnAttack(snapshot.attackTurn, { strikeMode: action.strikeMode, extra }, fighter.sta);
   if (!economy.ok) return economy;
@@ -540,12 +574,16 @@ export function deriveAttackDeclaration(
       extra,
       automaticModifier: economy.hitModifier,
       staminaCost: economy.staminaCost,
+      contextAttackModifier: context.attackerModifier,
+      contextDefenseModifier: context.defenderModifier,
+      contextNote: context.notes.join("; "),
     },
   };
 }
 
-function rejectedAttackEconomy(code: AttackTurnError | "fighter_missing"): ActionValidationResult {
+function rejectedAttackEconomy(code: AttackTurnError | "fighter_missing" | "invalid_position"): ActionValidationResult {
   if (code === "fighter_missing") return rejected("fighter_missing", "The active fighter is unavailable.");
+  if (code === "invalid_position") return rejected("invalid_encounter_action", "The weapon cannot be used from the current position.");
   if (code === "insufficient_stamina") return rejected("insufficient_stamina", "The fighter needs 3 STA for an extra attack.");
   return rejected("invalid_attack_sequence", "That attack is not available in the current attack action.");
 }
@@ -575,33 +613,77 @@ export function validateClientMessage(message: ClientMessage, actor: Side, snaps
     return snapshot.phase === "complete" ? { ok: true } : rejected("wrong_phase", "The battle is not complete.");
   }
   if (snapshot.phase !== "combat") return rejected("wrong_phase", "Combat action is only allowed during combat.");
-  if (!snapshot.fighters) return rejected("fighter_missing", "Combatants are not initialized.");
+  if (!snapshot.fighters || !snapshot.encounter) return rejected("fighter_missing", "Combatants are not initialized.");
 
   if (action.type === "choose_defense") {
     if (snapshot.pending || !snapshot.attackDeclaration) return rejected("no_pending_attack", "There is no declared attack awaiting a defense.");
     if (snapshot.attackDeclaration.defender !== actor || snapshot.active === actor) return rejected("not_your_turn", "Only the defending player can choose this defense.");
+    const cannotReact = snapshot.encounter.battlefield.actors[actor].stunnedTurns > 0
+      || combinedCombatModifiers(snapshot.encounter, actor).cannotReact;
+    if (cannotReact && action.defenseMode !== "none") return rejected("invalid_encounter_action", "This fighter cannot react and must use no defense.");
     return { ok: true };
   }
 
   if (snapshot.active !== actor) return rejected("not_your_turn", "The other fighter is active.");
+
+  if (action.type === "physical_action") {
+    if (snapshot.pending || snapshot.attackDeclaration || snapshot.attackTurn.standardMode !== null) return rejected("pending_resolution_required", "Finish the current attack sequence first.");
+    if (action.declaration.actor !== actor) return rejected("not_your_turn", "A fighter may declare only their own physical action.");
+    if (combinedCombatModifiers(snapshot.encounter, actor).cannotAct) return rejected("invalid_encounter_action", "A current condition prevents this action.");
+    const checked = validatePhysicalAction(snapshot.encounter.battlefield, action.declaration);
+    return checked.ok ? { ok: true } : rejected(checked.code === "insufficient_stamina" ? "insufficient_stamina" : "invalid_encounter_action", checked.message);
+  }
+  if (action.type === "cast_magic") {
+    if (snapshot.pending || snapshot.attackDeclaration || snapshot.attackTurn.standardMode !== null || snapshot.encounter.battlefield.turn.actionUsed) {
+      return rejected("pending_resolution_required", "Magic requires an unused main action.");
+    }
+    const ability = findMagicAbility(action.abilityId);
+    if (!ability) return rejected("invalid_encounter_action", "The magic ability is unknown.");
+    if (!canFighterUseMagicAbility(snapshot.fighters[actor], ability)) return rejected("invalid_encounter_action", "This fighter does not know that school of magic.");
+    if (combinedCombatModifiers(snapshot.encounter, actor).cannotAct) return rejected("invalid_encounter_action", "A current condition prevents casting.");
+    const checked = validateMagicDeclaration({
+      ability,
+      declaration: { id: `check_${snapshot.revision}`, abilityId: action.abilityId, caster: actor, target: action.target },
+      fighters: snapshot.fighters,
+      state: snapshot.encounter.magic,
+    });
+    return checked.ok ? { ok: true } : rejected(
+      checked.issues.some((issue) => issue.code === "insufficient_stamina" || issue.code === "insufficient_vigor") ? "insufficient_stamina" : "invalid_encounter_action",
+      checked.issues.map((issue) => issue.message).join(" "),
+    );
+  }
+  if (action.type === "stabilize_wound") {
+    if (snapshot.pending || snapshot.attackDeclaration || snapshot.attackTurn.standardMode !== null || snapshot.encounter.battlefield.turn.actionUsed) {
+      return rejected("pending_resolution_required", "First aid requires an unused main action.");
+    }
+    if (combinedCombatModifiers(snapshot.encounter, actor).cannotAct) return rejected("invalid_encounter_action", "A current condition prevents first aid.");
+    const wound = snapshot.encounter.effects[actor].wounds.find((item) => item.id === action.woundId);
+    return wound && !wound.stabilized
+      ? { ok: true }
+      : rejected("invalid_encounter_action", "The wound is missing or already stabilized.");
+  }
 
   if (action.type === "declare_attack") {
     if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
     const weapon = snapshot.fighters[actor].weapons.find((item) => item.uid === action.weaponUid);
     if (!weapon) return rejected("unknown_weapon", "The selected weapon does not belong to the active fighter.");
     if (!weapon.damage.trim()) return rejected("invalid_attack_sequence", "The selected weapon has no damage formula.");
+    if (snapshot.attackTurn.standardMode === null && snapshot.encounter.battlefield.turn.actionUsed) return rejected("invalid_encounter_action", "The main action has already been used.");
     const derived = deriveAttackDeclaration(snapshot, action);
     return derived.ok ? { ok: true } : rejectedAttackEconomy(derived.code);
   }
   if (action.type === "end_turn") {
     if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
-    return snapshot.attackTurn.standardMode === null
-      ? rejected("invalid_attack_sequence", "End an attack turn only after beginning an attack action.")
-      : { ok: true };
+    return snapshot.attackTurn.standardMode !== null || snapshot.encounter.battlefield.turn.movementUsed || snapshot.encounter.battlefield.turn.actionUsed
+      ? { ok: true }
+      : rejected("invalid_attack_sequence", "Perform an action before ending the turn.");
   }
   if (action.type === "recover" || action.type === "pass") {
     if (snapshot.pending || snapshot.attackDeclaration) return rejected("pending_resolution_required", "Resolve the current attack first.");
-    return snapshot.attackTurn.standardMode === null
+    if (action.type === "recover" && (snapshot.encounter.battlefield.actors[actor].stunnedTurns > 0 || combinedCombatModifiers(snapshot.encounter, actor).cannotAct)) {
+      return rejected("invalid_encounter_action", "A stunned fighter can only pass the turn.");
+    }
+    return snapshot.attackTurn.standardMode === null && !snapshot.encounter.battlefield.turn.actionUsed
       ? { ok: true }
       : rejected("invalid_attack_sequence", "Recovery and passing are unavailable after an attack action has begun.");
   }

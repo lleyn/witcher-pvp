@@ -2,6 +2,7 @@ export const STAT_KEYS = ["INT", "REF", "DEX", "BODY", "SPD", "EMP", "CRA", "WIL
 
 export type StatKey = (typeof STAT_KEYS)[number];
 export type LocationKey = "head" | "torso" | "arms" | "legs";
+export type MagicKind = "sign" | "spell" | "invocation" | "ritual" | "hex";
 
 export type RawCharacter = Record<string, unknown> & {
   name?: string;
@@ -34,6 +35,12 @@ export type ArmorZone = {
   natural: number;
 };
 
+export type FighterMagicRef = {
+  id: string;
+  name: string;
+  kind: MagicKind;
+};
+
 export type Fighter = {
   id: string;
   sourceId: string;
@@ -46,6 +53,10 @@ export type Fighter = {
   maxHp: number;
   sta: number;
   maxSta: number;
+  vigor: number;
+  maxVigor: number;
+  resolve: number;
+  maxResolve: number;
   stun: number;
   rec: number;
   run: number;
@@ -54,6 +65,7 @@ export type Fighter = {
   meleeDamageBonus: number;
   armor: Record<LocationKey, ArmorZone>;
   weapons: Weapon[];
+  magic: FighterMagicRef[];
   warnings: string[];
   raw: RawCharacter;
 };
@@ -114,6 +126,8 @@ const FAMILY_STATS: Record<string, Partial<Record<StatKey, number>>> = {
 const FAMILY_SKILLS: Record<string, string> = {
   north_mage_ward: "education", nilf_priesthood: "courage", elder_scholars: "education",
 };
+
+const PROFESSION_VIGOR: Record<string, number> = { witcher: 2, priest: 2, mage: 5 };
 
 export const RACE_LABELS: Record<string, string> = {
   human: "Человек", elf: "Эльф", dwarf: "Краснолюд", witcher: "Ведьмак", halfling: "Низушек",
@@ -319,6 +333,23 @@ function buildArmor(character: RawCharacter): Record<LocationKey, ArmorZone> {
   })) as Record<LocationKey, ArmorZone>;
 }
 
+function buildKnownMagic(character: RawCharacter): FighterMagicRef[] {
+  const known = asObject(asObject(character.magic).known);
+  const groups: Array<[string, MagicKind]> = [
+    ["signs", "sign"], ["spells", "spell"], ["invocations", "invocation"], ["rituals", "ritual"], ["hexes", "hex"],
+  ];
+  const result: FighterMagicRef[] = [];
+  for (const [key, kind] of groups) {
+    for (const [index, entry] of asArray(known[key]).entries()) {
+      const object = asObject(entry);
+      const id = typeof entry === "string" ? entry : asString(object.id, asString(object.catalogId, `${kind}_${index}`));
+      const name = typeof entry === "string" ? entry : asString(object.name, id);
+      if (id || name) result.push({ id: id || `${kind}_${index}`, name: name || id, kind });
+    }
+  }
+  return result;
+}
+
 export function buildFighter(character: RawCharacter, inheritedWarnings: string[] = []): Fighter {
   const stats = effectiveStats(character);
   const info = asObject(character.info);
@@ -342,6 +373,12 @@ export function buildFighter(character: RawCharacter, inheritedWarnings: string[
   const warnings = [...inheritedWarnings];
   const hp = Object.hasOwn(vitals, "hp") ? asNumber(vitals.hp) : maxHp;
   const sta = Object.hasOwn(vitals, "sta") ? asNumber(vitals.sta) : maxSta;
+  const profession = asString(info.profession, "witcher");
+  const defaultVigor = PROFESSION_VIGOR[profession] ?? 0;
+  const maxVigor = Object.hasOwn(vitals, "vigorMax") ? asNumber(vitals.vigorMax) : defaultVigor;
+  const vigor = Object.hasOwn(vitals, "vigor") ? asNumber(vitals.vigor) : maxVigor;
+  const maxResolve = Math.ceil((stats.WILL + stats.INT) / 2) * 5;
+  const resolve = Object.hasOwn(vitals, "resolve") ? asNumber(vitals.resolve) : maxResolve;
   if (!Object.hasOwn(vitals, "hp")) warnings.push("Текущие ПЗ отсутствовали — использован максимум.");
   if (!Object.hasOwn(vitals, "sta")) warnings.push("Текущая Выносливость отсутствовала — использован максимум.");
 
@@ -362,15 +399,15 @@ export function buildFighter(character: RawCharacter, inheritedWarnings: string[
 
   return {
     id: makeId("fighter"), sourceId: asString(character.id), name: asString(character.name, "Без имени"),
-    race: asString(info.race, "human"), profession: asString(info.profession, "witcher"), stats, skills,
-    hp, maxHp, sta, maxSta, stun: Math.min(10, half), rec: half, run: stats.SPD * 3,
+    race: asString(info.race, "human"), profession, stats, skills,
+    hp, maxHp, sta, maxSta, vigor, maxVigor, resolve, maxResolve, stun: Math.min(10, half), rec: half, run: stats.SPD * 3,
     leap: Math.round((stats.SPD * 3) / 5), initiativeBase: stats.REF,
     meleeDamageBonus: embedded.reduce((sum, bonus) => {
       const key = asString(bonus.key).toLocaleLowerCase("ru");
       return sum + (/урон.*ближн|melee.*damage/.test(key) ? asNumber(bonus.amount) : 0);
     }, 0),
     armor: buildArmor(character),
-    weapons, warnings, raw: character,
+    weapons, magic: buildKnownMagic(character), warnings, raw: character,
   };
 }
 
@@ -383,12 +420,13 @@ export function demoCharacter(side: "a" | "b"): RawCharacter {
   const isA = side === "a";
   return {
     schema: 3, id: `demo_${side}`, name: isA ? "Иара из Венгерберга" : "Даган Серый",
-    info: { race: isA ? "human" : "dwarf", profession: isA ? "man_at_arms" : "criminal", region: isA ? "temeria" : "mahakam" },
+    info: { race: isA ? "human" : "dwarf", profession: isA ? "mage" : "criminal", region: isA ? "temeria" : "mahakam" },
     stats: isA
       ? { INT: 6, REF: 8, DEX: 7, BODY: 7, SPD: 6, EMP: 5, CRA: 5, WILL: 7, LUCK: 5 }
       : { INT: 6, REF: 7, DEX: 6, BODY: 9, SPD: 5, EMP: 5, CRA: 6, WILL: 8, LUCK: 5 },
-    skills: isA ? { swordsmanship: 6, dodge_escape: 5, athletics: 4 } : { melee: 6, dodge_escape: 4, athletics: 4 },
-    vitals: { hp: isA ? 35 : 45, sta: isA ? 35 : 45 },
+    skills: isA ? { swordsmanship: 6, dodge_escape: 5, athletics: 4, spell_casting: 6, resist_magic: 5, ritual_crafting: 4 } : { melee: 6, dodge_escape: 4, athletics: 4 },
+    vitals: { hp: isA ? 35 : 45, sta: isA ? 35 : 45, vigor: isA ? 5 : 0, vigorMax: isA ? 5 : 0, resolve: isA ? 35 : 35 },
+    magic: isA ? { known: { spells: [{ id: "demo_arcane", name: "Чародейская стрела" }], rituals: [{ id: "demo_circle", name: "Удерживаемый круг" }] } } : { known: { spells: [], invocations: [], rituals: [], signs: [], hexes: [] } },
     inventory: {
       weapons: [{ uid: `demo_w_${side}`, name: isA ? "Стальной меч" : "Боевой топор", category: isA ? "sword" : "axe", damage: isA ? "4d6" : "5d6", accuracy: 0, reliability: 10, equipped: true, effects: [] }],
       armor: [{ uid: `demo_a_${side}`, name: isA ? "Кожаный доспех" : "Кольчуга", location: "torso", weightClass: isA ? "light" : "medium", sp: isA ? 8 : 12, spDamage: 0, ev: 0, enhancements: [], equipped: true }],
@@ -404,6 +442,6 @@ export function characterLabel(character: RawCharacter) {
 
 export function patchRawCharacter(rawCharacter: RawCharacter, fighter: PreparedFighter): RawCharacter {
   const raw = structuredClone(rawCharacter);
-  raw.vitals = { ...asObject(raw.vitals), hp: fighter.hp, sta: fighter.sta };
+  raw.vitals = { ...asObject(raw.vitals), hp: fighter.hp, sta: fighter.sta, vigor: fighter.vigor, vigorMax: fighter.maxVigor, resolve: fighter.resolve };
   return raw;
 }
