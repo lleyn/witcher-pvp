@@ -10,10 +10,11 @@
     "build": "tsc --noEmit && vite build",
     "start": "vite preview",
     "test": "npm run test:engine && npm run build && node --test tests/rendered-html.test.mjs",
-    "test:engine": "node --experimental-strip-types --test tests/engine.test.mjs",
+    "test:engine": "node --experimental-strip-types --test tests/engine.test.mjs tests/multiplayer.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "peerjs": "^1.5.5",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
@@ -23,7 +24,7 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "typescript": "5.9.3",
-    "vite": "8.0.13"
+    "vite": "^8.2.1"
   },
   "type": "module"
 }

@@ -1,4 +1,3 @@
-import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import DuelApp from "../app/components/DuelApp";
 import "../app/globals.css";
@@ -7,8 +6,4 @@ const root = document.getElementById("root");
 
 if (!root) throw new Error("Root element was not found.");
 
-createRoot(root).render(
-  <StrictMode>
-    <DuelApp />
-  </StrictMode>,
-);
+createRoot(root).render(<DuelApp />);

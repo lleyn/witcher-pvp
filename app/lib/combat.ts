@@ -1,4 +1,4 @@
-import type { Fighter, LocationKey, Weapon } from "./witcher";
+import type { LocationKey, PreparedFighter, Weapon } from "./witcher";
 
 export type DefenseMode = "dodge" | "reposition" | "block" | "none";
 export type StrikeMode = "normal" | "strong";
@@ -116,7 +116,7 @@ function criticalForMargin(margin: number) {
   return { level: null, bonus: 0 };
 }
 
-export function attackBase(fighter: Fighter, weapon: Weapon) {
+export function attackBase(fighter: PreparedFighter, weapon: Weapon) {
   return fighter.skills[weapon.attackSkill] ?? fighter.stats[weapon.category === "bow" || weapon.category === "crossbow" || weapon.category === "thrown" ? "DEX" : "REF"];
 }
 
@@ -130,7 +130,7 @@ export function meleeBodyBonus(body: number) {
   return 10;
 }
 
-export function defenseBase(fighter: Fighter, mode: DefenseMode, weapon?: Weapon) {
+export function defenseBase(fighter: PreparedFighter, mode: DefenseMode, weapon?: Weapon) {
   if (mode === "none") return 10;
   if (mode === "reposition") return fighter.skills.athletics ?? fighter.stats.DEX;
   if (mode === "block") return fighter.skills[weapon?.attackSkill ?? "melee"] ?? fighter.stats.REF;
@@ -138,7 +138,7 @@ export function defenseBase(fighter: Fighter, mode: DefenseMode, weapon?: Weapon
 }
 
 export function resolveAttack(args: {
-  fighters: [Fighter, Fighter]; attacker: 0 | 1; weapon: Weapon; defenseMode: DefenseMode; strikeMode: StrikeMode;
+  fighters: [PreparedFighter, PreparedFighter]; attacker: 0 | 1; weapon: Weapon; defenseMode: DefenseMode; strikeMode: StrikeMode;
   locationChoice: LocationKey | "random"; modifier: number; settings: CombatSettings; rng: () => number;
 }): PendingAttack {
   const { fighters, attacker, weapon, defenseMode, strikeMode, locationChoice, modifier, settings, rng } = args;

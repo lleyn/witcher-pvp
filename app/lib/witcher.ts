@@ -58,6 +58,8 @@ export type Fighter = {
   raw: RawCharacter;
 };
 
+export type PreparedFighter = Omit<Fighter, "raw" | "sourceId">;
+
 type JsonObject = Record<string, unknown>;
 
 const SKILL_STATS: Record<string, StatKey> = {
@@ -372,6 +374,11 @@ export function buildFighter(character: RawCharacter, inheritedWarnings: string[
   };
 }
 
+export function prepareFighter(fighter: Fighter): PreparedFighter {
+  const { raw: _raw, sourceId: _sourceId, ...prepared } = fighter;
+  return structuredClone(prepared);
+}
+
 export function demoCharacter(side: "a" | "b"): RawCharacter {
   const isA = side === "a";
   return {
@@ -395,8 +402,8 @@ export function characterLabel(character: RawCharacter) {
   return `${RACE_LABELS[asString(info.race)] ?? asString(info.race, "Неизвестная раса")} · ${PROFESSION_LABELS[asString(info.profession)] ?? asString(info.profession, "Неизвестная профессия")}`;
 }
 
-export function patchRawCharacter(fighter: Fighter): RawCharacter {
-  const raw = structuredClone(fighter.raw);
+export function patchRawCharacter(rawCharacter: RawCharacter, fighter: PreparedFighter): RawCharacter {
+  const raw = structuredClone(rawCharacter);
   raw.vitals = { ...asObject(raw.vitals), hp: fighter.hp, sta: fighter.sta };
   return raw;
 }
